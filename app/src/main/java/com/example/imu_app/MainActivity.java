@@ -43,6 +43,7 @@ import com.example.imu_app.model.AppStatus;
 import com.example.imu_app.model.ImuSample;
 import com.example.imu_app.model.PositionFix;
 import com.example.imu_app.model.TrackPoint;
+import com.example.imu_app.navigation.ImuNavigationProcessor;
 import com.example.imu_app.protocol.ImuCsvParser;
 import com.example.imu_app.protocol.PositionCsvParser;
 import com.example.imu_app.protocol.ProtocolParseException;
@@ -72,7 +73,11 @@ public class MainActivity extends AppCompatActivity {
     private static final int COLOR_MUTED = Color.rgb(118, 131, 152);
     private static final int MAX_TRACK_POINTS = 5000;
     private static final int REQUEST_OPEN_DATA_FILE = 3101;
-    private static final int FILE_REPLAY_DELAY_MS = 10;
+    private static final int FILE_REPLAY_DELAY_MS = 35;
+    private static final long UI_UPDATE_INTERVAL_MS = 50L;
+    private static final long TRAJECTORY_UPDATE_INTERVAL_MS = 50L;
+    private static final long MAP_UPDATE_INTERVAL_MS = 200L;
+    private static final long MAP_CAMERA_INTERVAL_MS = 1000L;
     private static final String PREFS_NAME = "imu_mobile_settings";
     private static final String AMAP_KEY = "0e8026cdfbf451fb8988af4207a0a509";
 
@@ -83,6 +88,7 @@ public class MainActivity extends AppCompatActivity {
     private final ImuCsvParser imuParser = new ImuCsvParser();
     private final PositionCsvParser positionParser = new PositionCsvParser();
     private final TrackRecorder trackRecorder = new TrackRecorder();
+    private final ImuNavigationProcessor imuNavigationProcessor = new ImuNavigationProcessor();
 
     private TcpClient tcpClient;
     private FrameLayout pageContainer;
@@ -139,6 +145,7 @@ public class MainActivity extends AppCompatActivity {
     private EditText referenceAltInput;
     private Spinner protocolSpinner;
     private Spinner modeSpinner;
+    private Spinner algorithmSpinner;
     private Button connectButton;
     private LinearLayout hostRow;
     private LinearLayout portRow;
@@ -146,6 +153,9 @@ public class MainActivity extends AppCompatActivity {
     private TextView filePathView;
     private Uri selectedFileUri;
     private Thread fileReaderThread;
+    private final List<TrackPoint> fileReplayPoints = new ArrayList<>();
+    private Runnable fileReplayRunnable;
+    private int fileReplayIndex = 0;
 
     private boolean connected = false;
     private volatile boolean fileReading = false;
@@ -157,13 +167,10 @@ public class MainActivity extends AppCompatActivity {
     private int framesSinceRateUpdate = 0;
     private long lastRateUpdateMillis = 0L;
     private int suppressedParseErrors = 0;
-
-    private double imuEast = 0.0;
-    private double imuNorth = 0.0;
-    private double imuUp = 0.0;
-    private double imuSpeed = 0.0;
-    private double imuYawDeg = 0.0;
-    private long lastImuTimestampMillis = 0L;
+    private long lastUiUpdateMillis = 0L;
+    private long lastTrajectoryUpdateMillis = 0L;
+    private long lastMapUpdateMillis = 0L;
+    private long lastMapCameraMoveMillis = 0L;
 
     private double referenceLatitude = 30.659462;
     private double referenceLongitude = 104.065735;
@@ -186,6 +193,7 @@ public class MainActivity extends AppCompatActivity {
         status.message = "等待 TCP 连接";
         buildUi();
         loadSettings();
+        resetImuNavigationProcessor();
         appendLog("INFO V3 监控闭环已就绪");
         appendLog("INFO 可 TCP 接收、文件读取、微信/QQ导入和记录导出");
         handleImportIntent(getIntent());
@@ -571,7 +579,7 @@ public class MainActivity extends AppCompatActivity {
         LinearLayout card = card();
         card.addView(text("工作模式", 16, COLOR_TEXT, Typeface.BOLD), matchWrap());
         modeSpinner = spinner(new String[]{"IMU 解算模式", "位置直显模式"});
-        Spinner algorithmSpinner = spinner(new String[]{"v2_tcp_preview", "v1_matlab_port", "v2_pdr_turn_snap"});
+        algorithmSpinner = spinner(new String[]{"v1_matlab_port", "v2_pdr_turn_snap"});
         card.addView(formRow("模式", modeSpinner), topMargin(10));
         card.addView(formRow("算法版本", algorithmSpinner), topMargin(8));
         return card;
@@ -703,12 +711,17 @@ public class MainActivity extends AppCompatActivity {
         appendLog("开始读取文件: " + displayNameForUri(selectedFileUri) + " / " + currentProtocol());
         updateAllViews();
 
-        fileReaderThread = new Thread(() -> readSelectedFile(selectedFileUri), "imu-file-reader");
+        if ("IMU CSV".equals(currentProtocol())) {
+            fileReaderThread = new Thread(() -> processImuFileBatch(selectedFileUri), "imu-file-batch-reader");
+        } else {
+            fileReaderThread = new Thread(() -> readSelectedFile(selectedFileUri), "imu-file-reader");
+        }
         fileReaderThread.start();
     }
 
     private void stopFileRead(String reason, boolean updateUi) {
         fileReading = false;
+        stopFileReplayTimer();
         if (fileReaderThread != null) {
             fileReaderThread.interrupt();
             fileReaderThread = null;
@@ -770,6 +783,72 @@ public class MainActivity extends AppCompatActivity {
                 status.dataRateHz = 0.0;
                 stopRecordingIfNeeded(false);
                 appendLog("ERROR 文件读取失败: " + status.message);
+                updateAllViews();
+            });
+        }
+    }
+
+    private void processImuFileBatch(Uri uri) {
+        List<ImuSample> samples = new ArrayList<>();
+        int lineCount = 0;
+        int parseErrors = 0;
+        Integer firstPacketId = null;
+        try (InputStream stream = getContentResolver().openInputStream(uri);
+             BufferedReader reader = stream == null ? null : new BufferedReader(new InputStreamReader(stream))) {
+            if (reader == null) {
+                throw new IOException("无法打开文件输入流");
+            }
+            String line;
+            while (fileReading && !Thread.currentThread().isInterrupted() && (line = reader.readLine()) != null) {
+                String frame = line.trim();
+                if (frame.isEmpty()) {
+                    continue;
+                }
+                lineCount++;
+                try {
+                    int packetId = packetIdFromLine(frame);
+                    if (firstPacketId == null) {
+                        firstPacketId = packetId;
+                    }
+                    long timestampMillis = Math.round((packetId - firstPacketId) * 1000.0 / 100.0);
+                    samples.add(imuParser.parse(frame, timestampMillis));
+                    if (recording) {
+                        trackRecorder.recordRaw(frame);
+                    }
+                } catch (ProtocolParseException | IOException error) {
+                    parseErrors++;
+                }
+            }
+            if (!fileReading) {
+                return;
+            }
+            List<TrackPoint> points = imuNavigationProcessor.processBatch(samples);
+            int finalLineCount = lineCount;
+            int finalParseErrors = parseErrors;
+            handler.post(() -> {
+                if (!fileReading) {
+                    return;
+                }
+                appendLog("FILE IMU BATCH: algorithm=" + currentAlgorithmVersion()
+                        + ", lines=" + finalLineCount
+                        + ", samples=" + samples.size()
+                        + ", track_points=" + points.size()
+                        + ", parse_errors=" + finalParseErrors);
+                startFileTrackReplay(points);
+            });
+        } catch (Exception error) {
+            if (!fileReading) {
+                return;
+            }
+            handler.post(() -> {
+                fileReading = false;
+                connected = false;
+                status.running = false;
+                status.connectionState = "错误";
+                status.message = error.getMessage() == null ? "IMU 文件批处理失败" : error.getMessage();
+                status.dataRateHz = 0.0;
+                stopRecordingIfNeeded(false);
+                appendLog("ERROR IMU 文件批处理失败: " + status.message);
                 updateAllViews();
             });
         }
@@ -895,12 +974,11 @@ public class MainActivity extends AppCompatActivity {
         framesSinceRateUpdate = 0;
         lastRateUpdateMillis = 0L;
         suppressedParseErrors = 0;
-        imuEast = 0.0;
-        imuNorth = 0.0;
-        imuUp = 0.0;
-        imuSpeed = 0.0;
-        imuYawDeg = 0.0;
-        lastImuTimestampMillis = 0L;
+        lastUiUpdateMillis = 0L;
+        lastTrajectoryUpdateMillis = 0L;
+        lastMapUpdateMillis = 0L;
+        lastMapCameraMoveMillis = 0L;
+        resetImuNavigationProcessor();
         referenceInitializedFromInput = false;
         if (recentRawText != null) {
             recentRawText.setText("原始行: --");
@@ -933,12 +1011,16 @@ public class MainActivity extends AppCompatActivity {
         long now = System.currentTimeMillis();
         try {
             TrackPoint point;
+            markFrameReceived();
             if ("Position CSV".equals(currentProtocol())) {
                 PositionFix fix = positionParser.parse(line, now);
                 point = trackPointFromPosition(fix);
             } else {
                 ImuSample sample = imuParser.parse(line, now);
                 point = trackPointFromImu(sample);
+            }
+            if (point == null) {
+                return;
             }
             appendTrackPoint(point);
             suppressedParseErrors = 0;
@@ -1023,52 +1105,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private TrackPoint trackPointFromImu(ImuSample sample) {
-        double dt = 0.02;
-        if (lastImuTimestampMillis > 0L) {
-            dt = Math.max((sample.timestampMillis - lastImuTimestampMillis) / 1000.0, 1e-3);
-            dt = Math.min(dt, 0.25);
-        }
-        lastImuTimestampMillis = sample.timestampMillis;
-
-        imuYawDeg = normalizeDegrees(imuYawDeg + Math.toDegrees(sample.gz) * dt);
-        double forwardAccel = clamp(sample.ax, -3.0, 3.0);
-        imuSpeed = clamp((imuSpeed + forwardAccel * dt) * 0.992, 0.0, 4.0);
-        double yawRad = Math.toRadians(imuYawDeg);
-        double velocityE = Math.cos(yawRad) * imuSpeed;
-        double velocityN = Math.sin(yawRad) * imuSpeed;
-        imuEast += velocityE * dt;
-        imuNorth += velocityN * dt;
-        imuUp += clamp(sample.az - 9.80665, -1.0, 1.0) * dt * 0.02;
-
-        double roll = Math.toDegrees(Math.atan2(sample.ay, sample.az));
-        double pitch = Math.toDegrees(Math.atan2(-sample.ax, Math.sqrt(sample.ay * sample.ay + sample.az * sample.az)));
-        double[] wgs84 = CoordinateConverter.enuToWgs84(
-                imuEast,
-                imuNorth,
-                imuUp,
-                referenceLatitude,
-                referenceLongitude,
-                referenceAltitude
-        );
-
-        return new TrackPoint(
-                sample.timestampMillis,
-                wgs84[0],
-                wgs84[1],
-                wgs84[2],
-                imuEast,
-                imuNorth,
-                imuUp,
-                velocityE,
-                velocityN,
-                0.0,
-                imuSpeed,
-                roll,
-                pitch,
-                imuYawDeg,
-                "IMU CSV / v2 preview",
-                1.0
-        );
+        return imuNavigationProcessor.process(sample);
     }
 
     private void appendTrackPoint(TrackPoint point) {
@@ -1087,12 +1124,6 @@ public class MainActivity extends AppCompatActivity {
         if (trackPoints.size() > MAX_TRACK_POINTS) {
             trackPoints.remove(0);
         }
-        status.packetCount++;
-        updateRate();
-        status.connectionState = fileReading ? "读取中" : "已连接";
-        status.running = true;
-        String activeMessage = fileReading ? "文件读取中" : "接收中";
-        status.message = recording ? activeMessage + " / 记录中" : activeMessage;
         if (recentTrackText != null) {
             recentTrackText.setText(String.format(
                     Locale.US,
@@ -1111,9 +1142,144 @@ public class MainActivity extends AppCompatActivity {
                 stopRecordingIfNeeded(true);
             }
         }
-        trajectoryView.setTrack(trackPoints);
-        pushTrackToMap();
+        updateLiveViewsThrottled();
+    }
+
+    private void startFileTrackReplay(List<TrackPoint> points) {
+        stopFileReplayTimer();
+        trackPoints.clear();
+        totalDistance = 0.0;
+        previousPoint = null;
+        clearMapTrack();
+        trajectoryView.clear();
+        fileReplayPoints.clear();
+        fileReplayPoints.addAll(points);
+        fileReplayIndex = 0;
+        status.packetCount = 0;
+        framesSinceRateUpdate = 0;
+        lastRateUpdateMillis = 0L;
+        status.dataRateHz = 1000.0 / FILE_REPLAY_DELAY_MS;
+
+        if (fileReplayPoints.isEmpty()) {
+            fileReading = false;
+            connected = false;
+            status.running = false;
+            status.connectionState = "已完成";
+            status.message = "文件没有可回放轨迹点";
+            stopRecordingIfNeeded(false);
+            appendLog("FILE REPLAY DONE: 没有可回放轨迹点");
+            updateAllViews();
+            return;
+        }
+
+        fileReading = true;
+        connected = true;
+        status.running = true;
+        status.connectionState = "文件回放";
+        status.message = "文件回放运行：0/" + fileReplayPoints.size() + " 个轨迹点";
+        appendLog("FILE REPLAY START: 从第 1 个轨迹点开始");
         updateAllViews();
+
+        fileReplayRunnable = new Runnable() {
+            @Override
+            public void run() {
+                replayNextFilePoint();
+            }
+        };
+        handler.post(fileReplayRunnable);
+    }
+
+    private void replayNextFilePoint() {
+        if (!fileReading || fileReplayIndex >= fileReplayPoints.size()) {
+            finishFileTrackReplay();
+            return;
+        }
+        TrackPoint point = fileReplayPoints.get(fileReplayIndex);
+        fileReplayIndex++;
+        status.packetCount = fileReplayIndex;
+        status.dataRateHz = 1000.0 / FILE_REPLAY_DELAY_MS;
+        status.connectionState = "文件回放";
+        status.running = true;
+        status.message = "文件回放运行：" + fileReplayIndex + "/" + fileReplayPoints.size() + " 个轨迹点";
+        appendTrackPoint(point);
+        if (fileReplayIndex >= fileReplayPoints.size()) {
+            finishFileTrackReplay();
+            return;
+        }
+        if (fileReplayRunnable != null) {
+            handler.postDelayed(fileReplayRunnable, FILE_REPLAY_DELAY_MS);
+        }
+    }
+
+    private void finishFileTrackReplay() {
+        stopFileReplayTimer();
+        fileReading = false;
+        connected = false;
+        status.running = false;
+        status.connectionState = "已完成";
+        status.message = "文件回放完成：" + fileReplayPoints.size() + " 个轨迹点";
+        status.dataRateHz = 0.0;
+        stopRecordingIfNeeded(false);
+        appendLog("FILE REPLAY DONE: " + fileReplayPoints.size() + " 个轨迹点");
+        updateAllViews();
+    }
+
+    private void stopFileReplayTimer() {
+        if (fileReplayRunnable != null) {
+            handler.removeCallbacks(fileReplayRunnable);
+            fileReplayRunnable = null;
+        }
+    }
+
+    private void markFrameReceived() {
+        status.packetCount++;
+        updateRate();
+        status.connectionState = fileReading ? "读取中" : "已连接";
+        status.running = true;
+        String activeMessage = fileReading ? "文件读取中" : "接收中";
+        status.message = recording ? activeMessage + " / 记录中" : activeMessage;
+        updateLiveViewsThrottled();
+    }
+
+    private void replaceTrackPoints(List<TrackPoint> points) {
+        trackPoints.clear();
+        totalDistance = 0.0;
+        previousPoint = null;
+        int start = Math.max(0, points.size() - MAX_TRACK_POINTS);
+        for (int i = start; i < points.size(); i++) {
+            TrackPoint point = points.get(i);
+            if (previousPoint != null) {
+                double step = Math.sqrt(
+                        Math.pow(point.east - previousPoint.east, 2)
+                                + Math.pow(point.north - previousPoint.north, 2)
+                                + Math.pow(point.up - previousPoint.up, 2)
+                );
+                if (Double.isFinite(step) && step < 500.0) {
+                    totalDistance += step;
+                }
+            }
+            previousPoint = point;
+            trackPoints.add(point);
+            if (recording) {
+                try {
+                    trackRecorder.recordTrack(point, totalDistance, currentProtocol());
+                } catch (IOException error) {
+                    appendLog("ERROR 写入轨迹记录失败: " + error.getMessage());
+                    stopRecordingIfNeeded(true);
+                    break;
+                }
+            }
+        }
+        if (recentTrackText != null && previousPoint != null) {
+            recentTrackText.setText(String.format(
+                    Locale.US,
+                    "轨迹点: E %.2f / N %.2f / V %.2f / Y %s",
+                    previousPoint.east,
+                    previousPoint.north,
+                    previousPoint.speed,
+                    previousPoint.yaw == null ? "--" : Formatters.oneDecimal(previousPoint.yaw)
+            ));
+        }
     }
 
     private void updateRate() {
@@ -1129,6 +1295,26 @@ public class MainActivity extends AppCompatActivity {
             status.dataRateHz = framesSinceRateUpdate * 1000.0 / elapsed;
             framesSinceRateUpdate = 0;
             lastRateUpdateMillis = now;
+        }
+    }
+
+    private void resetImuNavigationProcessor() {
+        imuNavigationProcessor.reset(referenceLatitude, referenceLongitude, referenceAltitude, currentAlgorithmVersion());
+    }
+
+    private void updateLiveViewsThrottled() {
+        long now = System.currentTimeMillis();
+        if (trajectoryView != null && now - lastTrajectoryUpdateMillis >= TRAJECTORY_UPDATE_INTERVAL_MS) {
+            trajectoryView.setTrack(trackPoints);
+            lastTrajectoryUpdateMillis = now;
+        }
+        if (aMap != null && now - lastMapUpdateMillis >= MAP_UPDATE_INTERVAL_MS) {
+            pushTrackToMap(false);
+            lastMapUpdateMillis = now;
+        }
+        if (now - lastUiUpdateMillis >= UI_UPDATE_INTERVAL_MS) {
+            updateAllViews();
+            lastUiUpdateMillis = now;
         }
     }
 
@@ -1217,7 +1403,7 @@ public class MainActivity extends AppCompatActivity {
         return transportSpinner == null ? "TCP Client" : String.valueOf(transportSpinner.getSelectedItem());
     }
 
-    private void pushTrackToMap() {
+    private void pushTrackToMap(boolean forceMoveCamera) {
         if (aMap == null) {
             return;
         }
@@ -1256,6 +1442,12 @@ public class MainActivity extends AppCompatActivity {
         } else {
             amapMarker.setPosition(current);
         }
+        long now = System.currentTimeMillis();
+        boolean shouldMoveCamera = forceMoveCamera || lastMapCameraMoveMillis == 0L || now - lastMapCameraMoveMillis >= MAP_CAMERA_INTERVAL_MS;
+        if (!shouldMoveCamera) {
+            return;
+        }
+        lastMapCameraMoveMillis = now;
         if (latLngs.size() == 1) {
             aMap.animateCamera(CameraUpdateFactory.newLatLngZoom(current, 18f));
         } else {
@@ -1289,6 +1481,11 @@ public class MainActivity extends AppCompatActivity {
 
     private String currentMode() {
         return modeSpinner == null ? status.mode : String.valueOf(modeSpinner.getSelectedItem());
+    }
+
+    private String currentAlgorithmVersion() {
+        String value = algorithmSpinner == null ? ImuNavigationProcessor.V1_MATLAB_PORT : String.valueOf(algorithmSpinner.getSelectedItem());
+        return ImuNavigationProcessor.normalizeAlgorithmVersion(value);
     }
 
     private boolean applyReferenceFromInputs() {
@@ -1333,6 +1530,7 @@ public class MainActivity extends AppCompatActivity {
         setSpinnerValue(transportSpinner, prefs.getString("transport", "TCP Client"));
         setSpinnerValue(protocolSpinner, prefs.getString("protocol", "IMU CSV"));
         setSpinnerValue(modeSpinner, prefs.getString("mode", "IMU 解算模式"));
+        setSpinnerValue(algorithmSpinner, prefs.getString("algorithm", ImuNavigationProcessor.V1_MATLAB_PORT));
         applyReferenceFromInputs();
         updateTransportUi();
     }
@@ -1348,6 +1546,7 @@ public class MainActivity extends AppCompatActivity {
                 .putString("transport", currentTransport())
                 .putString("protocol", currentProtocol())
                 .putString("mode", currentMode())
+                .putString("algorithm", currentAlgorithmVersion())
                 .putString("reference_latitude", referenceLatInput.getText().toString())
                 .putString("reference_longitude", referenceLonInput.getText().toString())
                 .putString("reference_altitude", referenceAltInput.getText().toString())
@@ -1482,7 +1681,7 @@ public class MainActivity extends AppCompatActivity {
         mapTab.setBackground(plainDrawable(COLOR_BLUE, COLOR_BLUE, dp(8)));
         deviceTab.setTextColor(COLOR_MUTED);
         deviceTab.setBackground(plainDrawable(Color.WHITE, COLOR_BORDER, dp(8)));
-        pushTrackToMap();
+        pushTrackToMap(true);
     }
 
     private void showDevicePage() {
@@ -1652,6 +1851,16 @@ public class MainActivity extends AppCompatActivity {
 
     private double valueOrZero(Double value) {
         return value == null ? 0.0 : value;
+    }
+
+    private int packetIdFromLine(String line) throws ProtocolParseException {
+        int commaIndex = line.indexOf(',');
+        String firstField = commaIndex >= 0 ? line.substring(0, commaIndex) : line;
+        try {
+            return (int) Math.round(Double.parseDouble(firstField.trim()));
+        } catch (NumberFormatException error) {
+            throw new ProtocolParseException("包号字段无效。");
+        }
     }
 
     private String trimForDisplay(String value, int maxLength) {
