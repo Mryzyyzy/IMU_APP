@@ -1,6 +1,7 @@
 package com.example.imu_app;
 
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.content.FileProvider;
 
 import android.content.Intent;
 import android.database.Cursor;
@@ -32,10 +33,12 @@ import com.example.imu_app.model.TrackPoint;
 import com.example.imu_app.protocol.ImuCsvParser;
 import com.example.imu_app.protocol.PositionCsvParser;
 import com.example.imu_app.protocol.ProtocolParseException;
+import com.example.imu_app.recording.TrackRecorder;
 import com.example.imu_app.ui.TrajectoryView;
 import com.example.imu_app.util.Formatters;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -64,6 +67,7 @@ public class MainActivity extends AppCompatActivity {
     private final List<String> logs = new ArrayList<>();
     private final ImuCsvParser imuParser = new ImuCsvParser();
     private final PositionCsvParser positionParser = new PositionCsvParser();
+    private final TrackRecorder trackRecorder = new TrackRecorder();
 
     private TcpClient tcpClient;
     private FrameLayout pageContainer;
@@ -96,6 +100,10 @@ public class MainActivity extends AppCompatActivity {
     private TextView deviceEndpoint;
     private TextView deviceRuntime;
     private TextView logText;
+    private TextView recentRawText;
+    private TextView recentTrackText;
+    private TextView latestRecordText;
+    private Button exportRecordButton;
     private Spinner transportSpinner;
     private EditText hostInput;
     private EditText portInput;
@@ -142,9 +150,17 @@ public class MainActivity extends AppCompatActivity {
         status.connectionState = "未连接";
         status.message = "等待 TCP 连接";
         buildUi();
-        appendLog("V2 TCP 接入与 CSV 解析已就绪");
-        appendLog("请选择协议，输入 Host/Port 后点击连接");
+        appendLog("INFO V3 监控闭环已就绪");
+        appendLog("INFO 可 TCP 接收、文件读取、微信/QQ导入和记录导出");
+        handleImportIntent(getIntent());
         updateAllViews();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleImportIntent(intent);
     }
 
     @Override
@@ -153,6 +169,7 @@ public class MainActivity extends AppCompatActivity {
             tcpClient.disconnect();
         }
         stopFileRead("关闭页面，停止文件读取", false);
+        stopRecordingIfNeeded(false);
         handler.removeCallbacksAndMessages(null);
         super.onDestroy();
     }
@@ -163,16 +180,46 @@ public class MainActivity extends AppCompatActivity {
         if (requestCode != REQUEST_OPEN_DATA_FILE || resultCode != RESULT_OK || data == null || data.getData() == null) {
             return;
         }
-        selectedFileUri = data.getData();
-        int flags = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        setSelectedFileUri(data.getData(), data.getFlags());
+        updateAllViews();
+    }
+
+    private void handleImportIntent(Intent intent) {
+        if (intent == null) {
+            return;
+        }
+        Uri uri = null;
+        if (Intent.ACTION_SEND.equals(intent.getAction())) {
+            Object stream = intent.getParcelableExtra(Intent.EXTRA_STREAM);
+            if (stream instanceof Uri) {
+                uri = (Uri) stream;
+            }
+        } else if (Intent.ACTION_VIEW.equals(intent.getAction())) {
+            uri = intent.getData();
+        }
+        if (uri == null) {
+            return;
+        }
+        setSelectedFileUri(uri, intent.getFlags());
+        if (transportSpinner != null) {
+            transportSpinner.setSelection(1);
+        }
+        appendLog("INFO 已从外部应用导入文件，可点击读取文件");
+        updateAllViews();
+    }
+
+    private void setSelectedFileUri(Uri uri, int intentFlags) {
+        selectedFileUri = uri;
+        int flags = intentFlags & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
         try {
             getContentResolver().takePersistableUriPermission(selectedFileUri, flags & Intent.FLAG_GRANT_READ_URI_PERMISSION);
         } catch (SecurityException ignored) {
             // Some providers grant one-shot read access only; that is still enough for immediate replay.
         }
-        filePathView.setText(displayNameForUri(selectedFileUri));
-        appendLog("已选择文件: " + displayNameForUri(selectedFileUri));
-        updateAllViews();
+        if (filePathView != null) {
+            filePathView.setText(displayNameForUri(selectedFileUri));
+        }
+        appendLog("INFO 已选择文件: " + displayNameForUri(selectedFileUri));
     }
 
     private void buildUi() {
@@ -313,6 +360,7 @@ public class MainActivity extends AppCompatActivity {
         page.addView(buildDeviceSummary(), matchWrap());
         page.addView(buildConnectionSettings(), sectionParams());
         page.addView(buildModeSettings(), sectionParams());
+        page.addView(buildRecentDataPanel(), sectionParams());
         page.addView(buildLogPanel(), sectionParams());
 
         LinearLayout wrapper = new LinearLayout(this);
@@ -396,6 +444,24 @@ public class MainActivity extends AppCompatActivity {
         Spinner algorithmSpinner = spinner(new String[]{"v2_tcp_preview", "v1_matlab_port", "v2_pdr_turn_snap"});
         card.addView(formRow("模式", modeSpinner), topMargin(10));
         card.addView(formRow("算法版本", algorithmSpinner), topMargin(8));
+        return card;
+    }
+
+    private View buildRecentDataPanel() {
+        LinearLayout card = card();
+        card.addView(text("最近数据", 16, COLOR_TEXT, Typeface.BOLD), matchWrap());
+        recentRawText = text("原始行: --", 12, COLOR_MUTED, Typeface.NORMAL);
+        recentRawText.setTypeface(Typeface.MONOSPACE);
+        recentTrackText = text("轨迹点: --", 12, COLOR_MUTED, Typeface.NORMAL);
+        recentTrackText.setTypeface(Typeface.MONOSPACE);
+        latestRecordText = text("记录文件: 无", 12, COLOR_MUTED, Typeface.NORMAL);
+        Button exportButton = smallButton("导出最新记录");
+        exportRecordButton = exportButton;
+        exportButton.setOnClickListener(v -> exportLatestRecording());
+        card.addView(recentRawText, topMargin(10));
+        card.addView(recentTrackText, topMargin(6));
+        card.addView(latestRecordText, topMargin(6));
+        card.addView(exportButton, topMargin(10));
         return card;
     }
 
@@ -536,6 +602,7 @@ public class MainActivity extends AppCompatActivity {
                 status.connectionState = "已完成";
                 status.message = "文件读取完成";
                 status.dataRateHz = 0.0;
+                stopRecordingIfNeeded(false);
                 appendLog("文件读取完成，共读取 " + finalLineCount + " 行");
                 updateAllViews();
             });
@@ -550,6 +617,7 @@ public class MainActivity extends AppCompatActivity {
                 status.connectionState = "错误";
                 status.message = error.getMessage() == null ? "文件读取失败" : error.getMessage();
                 status.dataRateHz = 0.0;
+                stopRecordingIfNeeded(false);
                 appendLog("ERROR 文件读取失败: " + status.message);
                 updateAllViews();
             });
@@ -595,6 +663,7 @@ public class MainActivity extends AppCompatActivity {
         status.connectionState = "未连接";
         status.message = reason;
         status.dataRateHz = 0.0;
+        stopRecordingIfNeeded(false);
         appendLog(reason);
         updateAllViews();
     }
@@ -623,9 +692,35 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void toggleRecording() {
-        recording = !recording;
-        appendLog(recording ? "开始记录标记" : "停止记录标记");
+        if (recording) {
+            stopRecordingIfNeeded(true);
+            return;
+        }
+        try {
+            trackRecorder.start(this);
+            recording = true;
+            appendLog("INFO 开始记录: " + trackRecorder.latestSummary());
+        } catch (IOException error) {
+            recording = false;
+            appendLog("ERROR 无法开始记录: " + error.getMessage());
+        }
         updateAllViews();
+    }
+
+    private void stopRecordingIfNeeded(boolean updateUi) {
+        if (!recording && !trackRecorder.isRecording()) {
+            return;
+        }
+        try {
+            trackRecorder.stop();
+            appendLog("INFO 停止记录: " + trackRecorder.latestSummary());
+        } catch (IOException error) {
+            appendLog("ERROR 停止记录失败: " + error.getMessage());
+        }
+        recording = false;
+        if (updateUi) {
+            updateAllViews();
+        }
     }
 
     private void clearTrack() {
@@ -653,6 +748,12 @@ public class MainActivity extends AppCompatActivity {
         referenceLatitude = null;
         referenceLongitude = null;
         referenceAltitude = null;
+        if (recentRawText != null) {
+            recentRawText.setText("原始行: --");
+        }
+        if (recentTrackText != null) {
+            recentTrackText.setText("轨迹点: --");
+        }
         if (!keepConnectionState) {
             connected = false;
             status.connectionState = "未连接";
@@ -663,6 +764,17 @@ public class MainActivity extends AppCompatActivity {
     private void handleIncomingLine(String line) {
         if (receivingPaused) {
             return;
+        }
+        if (recentRawText != null) {
+            recentRawText.setText("原始行: " + trimForDisplay(line, 96));
+        }
+        if (recording) {
+            try {
+                trackRecorder.recordRaw(line);
+            } catch (IOException error) {
+                appendLog("ERROR 写入原始记录失败: " + error.getMessage());
+                stopRecordingIfNeeded(true);
+            }
         }
         long now = System.currentTimeMillis();
         try {
@@ -801,9 +913,28 @@ public class MainActivity extends AppCompatActivity {
         }
         status.packetCount++;
         updateRate();
-        status.connectionState = "已连接";
+        status.connectionState = fileReading ? "读取中" : "已连接";
         status.running = true;
-        status.message = recording ? "接收中 / 记录标记" : "接收中";
+        String activeMessage = fileReading ? "文件读取中" : "接收中";
+        status.message = recording ? activeMessage + " / 记录中" : activeMessage;
+        if (recentTrackText != null) {
+            recentTrackText.setText(String.format(
+                    Locale.US,
+                    "轨迹点: E %.2f / N %.2f / V %.2f / Y %s",
+                    point.east,
+                    point.north,
+                    point.speed,
+                    point.yaw == null ? "--" : Formatters.oneDecimal(point.yaw)
+            ));
+        }
+        if (recording) {
+            try {
+                trackRecorder.recordTrack(point, totalDistance, currentProtocol());
+            } catch (IOException error) {
+                appendLog("ERROR 写入轨迹记录失败: " + error.getMessage());
+                stopRecordingIfNeeded(true);
+            }
+        }
         trajectoryView.setTrack(trackPoints);
         updateAllViews();
     }
@@ -871,6 +1002,12 @@ public class MainActivity extends AppCompatActivity {
         recordButton.setText(recording ? "停止记录" : "记录");
         recordButton.setBackground(plainDrawable(recording ? COLOR_RED : Color.WHITE, COLOR_RED, dp(6)));
         recordButton.setTextColor(recording ? Color.WHITE : COLOR_RED);
+        if (latestRecordText != null) {
+            latestRecordText.setText("记录文件: " + trackRecorder.latestSummary());
+        }
+        if (exportRecordButton != null) {
+            exportRecordButton.setEnabled(!trackRecorder.latestFiles().isEmpty());
+        }
 
         deviceConnection.setText("● " + status.connectionState);
         deviceConnection.setTextColor(connectionColor);
@@ -897,6 +1034,28 @@ public class MainActivity extends AppCompatActivity {
 
     private String currentMode() {
         return modeSpinner == null ? status.mode : String.valueOf(modeSpinner.getSelectedItem());
+    }
+
+    private void exportLatestRecording() {
+        List<File> files = trackRecorder.latestFiles();
+        if (files.isEmpty()) {
+            appendLog("WARN 暂无可导出的记录文件");
+            return;
+        }
+        if (recording) {
+            stopRecordingIfNeeded(true);
+        }
+        ArrayList<Uri> uris = new ArrayList<>();
+        for (File file : files) {
+            Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", file);
+            uris.add(uri);
+        }
+        Intent intent = new Intent(Intent.ACTION_SEND_MULTIPLE);
+        intent.setType("text/*");
+        intent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        appendLog("INFO 导出记录文件: " + files.size() + " 个");
+        startActivity(Intent.createChooser(intent, "导出 IMU 记录"));
     }
 
     private void updateTransportUi() {
@@ -942,11 +1101,22 @@ public class MainActivity extends AppCompatActivity {
 
     private void appendLog(String message) {
         String time = new SimpleDateFormat("HH:mm:ss", Locale.CHINA).format(new Date());
-        logs.add(time + "  " + message);
+        logs.add(time + "  " + normalizeLogMessage(message));
         while (logs.size() > 100) {
             logs.remove(0);
         }
         updateLogText();
+    }
+
+    private String normalizeLogMessage(String message) {
+        if (message == null || message.trim().isEmpty()) {
+            return "INFO --";
+        }
+        String trimmed = message.trim();
+        if (trimmed.startsWith("INFO ") || trimmed.startsWith("WARN ") || trimmed.startsWith("ERROR ")) {
+            return trimmed;
+        }
+        return "INFO " + trimmed;
     }
 
     private void updateLogText() {
@@ -1135,6 +1305,17 @@ public class MainActivity extends AppCompatActivity {
         return value == null ? 0.0 : value;
     }
 
+    private String trimForDisplay(String value, int maxLength) {
+        if (value == null) {
+            return "--";
+        }
+        String trimmed = value.trim();
+        if (trimmed.length() <= maxLength) {
+            return trimmed;
+        }
+        return trimmed.substring(0, Math.max(0, maxLength - 3)) + "...";
+    }
+
     private double normalizeDegrees(double value) {
         double normalized = value % 360.0;
         return normalized < 0.0 ? normalized + 360.0 : normalized;
@@ -1171,6 +1352,7 @@ public class MainActivity extends AppCompatActivity {
                 status.connectionState = "未连接";
                 status.message = reason;
                 status.dataRateHz = 0.0;
+                stopRecordingIfNeeded(false);
                 appendLog("WARN " + reason);
                 updateAllViews();
             });
@@ -1184,6 +1366,7 @@ public class MainActivity extends AppCompatActivity {
                 status.connectionState = "错误";
                 status.message = message == null ? "TCP 错误" : message;
                 status.dataRateHz = 0.0;
+                stopRecordingIfNeeded(false);
                 appendLog("ERROR TCP: " + status.message);
                 updateAllViews();
             });
