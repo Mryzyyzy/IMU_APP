@@ -4,6 +4,7 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.content.FileProvider;
 
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.graphics.Color;
 import android.graphics.Typeface;
@@ -25,7 +26,19 @@ import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
 
+import com.amap.api.maps.AMap;
+import com.amap.api.maps.CameraUpdateFactory;
+import com.amap.api.maps.MapView;
+import com.amap.api.maps.MapsInitializer;
+import com.amap.api.maps.model.BitmapDescriptorFactory;
+import com.amap.api.maps.model.LatLng;
+import com.amap.api.maps.model.LatLngBounds;
+import com.amap.api.maps.model.Marker;
+import com.amap.api.maps.model.MarkerOptions;
+import com.amap.api.maps.model.Polyline;
+import com.amap.api.maps.model.PolylineOptions;
 import com.example.imu_app.communication.TcpClient;
+import com.example.imu_app.coordinate.CoordinateConverter;
 import com.example.imu_app.model.AppStatus;
 import com.example.imu_app.model.ImuSample;
 import com.example.imu_app.model.PositionFix;
@@ -60,6 +73,8 @@ public class MainActivity extends AppCompatActivity {
     private static final int MAX_TRACK_POINTS = 5000;
     private static final int REQUEST_OPEN_DATA_FILE = 3101;
     private static final int FILE_REPLAY_DELAY_MS = 10;
+    private static final String PREFS_NAME = "imu_mobile_settings";
+    private static final String AMAP_KEY = "0e8026cdfbf451fb8988af4207a0a509";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final AppStatus status = new AppStatus();
@@ -72,10 +87,22 @@ public class MainActivity extends AppCompatActivity {
     private TcpClient tcpClient;
     private FrameLayout pageContainer;
     private Button trajectoryTab;
+    private Button mapTab;
     private Button deviceTab;
     private LinearLayout trajectoryPage;
+    private LinearLayout mapPage;
     private LinearLayout devicePage;
     private TrajectoryView trajectoryView;
+    private Bundle mapSavedInstanceState;
+    private MapView amapMapView;
+    private AMap aMap;
+    private Polyline amapPolyline;
+    private Marker amapMarker;
+    private TextView mapStatusText;
+    private TextView mapInfoText;
+    private TextView mapEmptyText;
+    private boolean amapLoaded = false;
+    private boolean mapHasTrack = false;
 
     private TextView headerConnection;
     private TextView headerSubtitle;
@@ -107,6 +134,9 @@ public class MainActivity extends AppCompatActivity {
     private Spinner transportSpinner;
     private EditText hostInput;
     private EditText portInput;
+    private EditText referenceLatInput;
+    private EditText referenceLonInput;
+    private EditText referenceAltInput;
     private Spinner protocolSpinner;
     private Spinner modeSpinner;
     private Button connectButton;
@@ -135,9 +165,10 @@ public class MainActivity extends AppCompatActivity {
     private double imuYawDeg = 0.0;
     private long lastImuTimestampMillis = 0L;
 
-    private Double referenceLatitude;
-    private Double referenceLongitude;
-    private Double referenceAltitude;
+    private double referenceLatitude = 30.659462;
+    private double referenceLongitude = 104.065735;
+    private double referenceAltitude = 482.0;
+    private boolean referenceInitializedFromInput = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -146,10 +177,15 @@ public class MainActivity extends AppCompatActivity {
             getSupportActionBar().hide();
         }
         getWindow().setStatusBarColor(COLOR_BLUE);
+        MapsInitializer.updatePrivacyShow(this, true, true);
+        MapsInitializer.updatePrivacyAgree(this, true);
+        MapsInitializer.setApiKey(AMAP_KEY);
         tcpClient = new TcpClient(new TcpEvents());
+        mapSavedInstanceState = savedInstanceState;
         status.connectionState = "未连接";
         status.message = "等待 TCP 连接";
         buildUi();
+        loadSettings();
         appendLog("INFO V3 监控闭环已就绪");
         appendLog("INFO 可 TCP 接收、文件读取、微信/QQ导入和记录导出");
         handleImportIntent(getIntent());
@@ -171,7 +207,35 @@ public class MainActivity extends AppCompatActivity {
         stopFileRead("关闭页面，停止文件读取", false);
         stopRecordingIfNeeded(false);
         handler.removeCallbacksAndMessages(null);
+        if (amapMapView != null) {
+            amapMapView.onDestroy();
+        }
         super.onDestroy();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (amapMapView != null) {
+            amapMapView.onResume();
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        saveSettings();
+        if (amapMapView != null) {
+            amapMapView.onPause();
+        }
+        super.onPause();
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        if (amapMapView != null) {
+            amapMapView.onSaveInstanceState(outState);
+        }
     }
 
     @Override
@@ -236,8 +300,10 @@ public class MainActivity extends AppCompatActivity {
         ));
 
         trajectoryPage = buildTrajectoryPage();
+        mapPage = buildMapPage();
         devicePage = buildDevicePage();
         pageContainer.addView(trajectoryPage);
+        pageContainer.addView(mapPage);
         pageContainer.addView(devicePage);
 
         root.addView(buildBottomNav(), new LinearLayout.LayoutParams(
@@ -347,6 +413,69 @@ public class MainActivity extends AppCompatActivity {
         return controls;
     }
 
+    private LinearLayout buildMapPage() {
+        LinearLayout page = new LinearLayout(this);
+        page.setOrientation(LinearLayout.VERTICAL);
+        page.setPadding(dp(14), dp(12), dp(14), dp(10));
+        page.setBackgroundColor(COLOR_PAGE);
+
+        LinearLayout statusCard = card();
+        mapStatusText = text("● 未连接 | 0 Hz | 包: 0", 14, COLOR_MUTED, Typeface.BOLD);
+        statusCard.addView(mapStatusText, matchWrap());
+        page.addView(statusCard, matchWrap());
+
+        FrameLayout mapFrame = new FrameLayout(this);
+        mapFrame.setBackground(cardDrawable());
+        mapFrame.setPadding(dp(1), dp(1), dp(1), dp(1));
+        LinearLayout.LayoutParams mapParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+        );
+        mapParams.setMargins(0, dp(10), 0, dp(10));
+
+        amapMapView = new MapView(this);
+        amapMapView.onCreate(mapSavedInstanceState);
+        aMap = amapMapView.getMap();
+        aMap.getUiSettings().setZoomControlsEnabled(true);
+        aMap.getUiSettings().setCompassEnabled(true);
+        aMap.setOnMapLoadedListener(() -> {
+            amapLoaded = true;
+            if (mapHasTrack && mapEmptyText != null) {
+                mapEmptyText.setVisibility(View.GONE);
+            }
+            appendLog("INFO 高德地图加载完成");
+        });
+        aMap.moveCamera(CameraUpdateFactory.newLatLngZoom(new LatLng(referenceLatitude, referenceLongitude), 17f));
+        handler.postDelayed(() -> {
+            if (!amapLoaded && mapEmptyText != null) {
+                mapEmptyText.setVisibility(View.VISIBLE);
+                mapEmptyText.setText("高德地图未加载：请检查 Android Key、SHA1、包名和网络");
+                appendLog("WARN 高德地图未加载，优先检查 Key/SHA1/包名是否匹配");
+            }
+        }, 6000);
+        mapFrame.addView(amapMapView, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+        ));
+
+        mapEmptyText = text("等待轨迹数据，IMU/ENU 将按参考原点映射到地图", 15, COLOR_MUTED, Typeface.BOLD);
+        mapEmptyText.setGravity(Gravity.CENTER);
+        mapEmptyText.setBackgroundColor(Color.argb(210, 255, 255, 255));
+        mapFrame.addView(mapEmptyText, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+        ));
+        page.addView(mapFrame, mapParams);
+
+        LinearLayout infoCard = card();
+        mapInfoText = text("速度 --   距离 0.0 m   航向 --", 14, COLOR_TEXT, Typeface.BOLD);
+        mapInfoText.setGravity(Gravity.CENTER);
+        infoCard.addView(mapInfoText, matchWrap());
+        page.addView(infoCard, matchWrap());
+        return page;
+    }
+
     private LinearLayout buildDevicePage() {
         ScrollView scrollView = new ScrollView(this);
         scrollView.setFillViewport(true);
@@ -360,6 +489,7 @@ public class MainActivity extends AppCompatActivity {
         page.addView(buildDeviceSummary(), matchWrap());
         page.addView(buildConnectionSettings(), sectionParams());
         page.addView(buildModeSettings(), sectionParams());
+        page.addView(buildReferenceSettings(), sectionParams());
         page.addView(buildRecentDataPanel(), sectionParams());
         page.addView(buildLogPanel(), sectionParams());
 
@@ -447,6 +577,20 @@ public class MainActivity extends AppCompatActivity {
         return card;
     }
 
+    private View buildReferenceSettings() {
+        LinearLayout card = card();
+        card.addView(text("地图参考原点", 16, COLOR_TEXT, Typeface.BOLD), matchWrap());
+        TextView hint = text("用于把 IMU/ENU 局部轨迹换算到高德地图", 12, COLOR_MUTED, Typeface.NORMAL);
+        card.addView(hint, topMargin(6));
+        referenceLatInput = editText("30.659462");
+        referenceLonInput = editText("104.065735");
+        referenceAltInput = editText("482.0");
+        card.addView(formRow("纬度", referenceLatInput), topMargin(10));
+        card.addView(formRow("经度", referenceLonInput), topMargin(8));
+        card.addView(formRow("高度", referenceAltInput), topMargin(8));
+        return card;
+    }
+
     private View buildRecentDataPanel() {
         LinearLayout card = card();
         card.addView(text("最近数据", 16, COLOR_TEXT, Typeface.BOLD), matchWrap());
@@ -502,10 +646,13 @@ public class MainActivity extends AppCompatActivity {
         nav.setBackgroundColor(Color.WHITE);
 
         trajectoryTab = navButton("轨迹");
+        mapTab = navButton("地图");
         deviceTab = navButton("设备");
         trajectoryTab.setOnClickListener(v -> showTrajectoryPage());
+        mapTab.setOnClickListener(v -> showMapPage());
         deviceTab.setOnClickListener(v -> showDevicePage());
         nav.addView(trajectoryTab, buttonWeightParams());
+        nav.addView(mapTab, buttonWeightParams());
         nav.addView(deviceTab, buttonWeightParams());
         return nav;
     }
@@ -533,6 +680,10 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void startFileRead() {
+        if (!applyReferenceFromInputs()) {
+            return;
+        }
+        saveSettings();
         if (selectedFileUri == null) {
             appendLog("WARN 请先选择微信/QQ保存出来的数据文件");
             openFilePicker();
@@ -629,6 +780,10 @@ public class MainActivity extends AppCompatActivity {
             disconnectTcp("手动断开");
             return;
         }
+        if (!applyReferenceFromInputs()) {
+            return;
+        }
+        saveSettings();
         if (fileReading) {
             stopFileRead("切换到 TCP", false);
         }
@@ -726,6 +881,7 @@ public class MainActivity extends AppCompatActivity {
     private void clearTrack() {
         resetRuntimeState(true);
         trajectoryView.clear();
+        clearMapTrack();
         appendLog("轨迹已清空");
         updateAllViews();
     }
@@ -745,9 +901,7 @@ public class MainActivity extends AppCompatActivity {
         imuSpeed = 0.0;
         imuYawDeg = 0.0;
         lastImuTimestampMillis = 0L;
-        referenceLatitude = null;
-        referenceLongitude = null;
-        referenceAltitude = null;
+        referenceInitializedFromInput = false;
         if (recentRawText != null) {
             recentRawText.setText("原始行: --");
         }
@@ -800,22 +954,36 @@ public class MainActivity extends AppCompatActivity {
         double east;
         double north;
         double up;
+        Double latitude = fix.latitude;
+        Double longitude = fix.longitude;
+        Double altitude = fix.altitude;
         if (fix.latitude != null && fix.longitude != null && fix.altitude != null) {
-            if (referenceLatitude == null) {
-                referenceLatitude = fix.latitude;
-                referenceLongitude = fix.longitude;
-                referenceAltitude = fix.altitude;
-                appendLog("设置经纬度参考点: " + Formatters.optional(referenceLatitude, 6) + ", " + Formatters.optional(referenceLongitude, 6));
-            }
-            double latScale = 110540.0;
-            double lonScale = 111320.0 * Math.cos(Math.toRadians(referenceLatitude));
-            east = (fix.longitude - referenceLongitude) * lonScale;
-            north = (fix.latitude - referenceLatitude) * latScale;
-            up = fix.altitude - referenceAltitude;
+            double[] enu = CoordinateConverter.wgs84ToEnu(
+                    fix.latitude,
+                    fix.longitude,
+                    fix.altitude,
+                    referenceLatitude,
+                    referenceLongitude,
+                    referenceAltitude
+            );
+            east = enu[0];
+            north = enu[1];
+            up = enu[2];
         } else {
             east = valueOrZero(fix.x);
             north = valueOrZero(fix.y);
             up = valueOrZero(fix.z);
+            double[] wgs84 = CoordinateConverter.enuToWgs84(
+                    east,
+                    north,
+                    up,
+                    referenceLatitude,
+                    referenceLongitude,
+                    referenceAltitude
+            );
+            latitude = wgs84[0];
+            longitude = wgs84[1];
+            altitude = wgs84[2];
         }
 
         double velocityE = 0.0;
@@ -836,9 +1004,9 @@ public class MainActivity extends AppCompatActivity {
 
         return new TrackPoint(
                 fix.timestampMillis,
-                fix.latitude,
-                fix.longitude,
-                fix.altitude,
+                latitude,
+                longitude,
+                altitude,
                 east,
                 north,
                 up,
@@ -874,12 +1042,20 @@ public class MainActivity extends AppCompatActivity {
 
         double roll = Math.toDegrees(Math.atan2(sample.ay, sample.az));
         double pitch = Math.toDegrees(Math.atan2(-sample.ax, Math.sqrt(sample.ay * sample.ay + sample.az * sample.az)));
+        double[] wgs84 = CoordinateConverter.enuToWgs84(
+                imuEast,
+                imuNorth,
+                imuUp,
+                referenceLatitude,
+                referenceLongitude,
+                referenceAltitude
+        );
 
         return new TrackPoint(
                 sample.timestampMillis,
-                null,
-                null,
-                null,
+                wgs84[0],
+                wgs84[1],
+                wgs84[2],
                 imuEast,
                 imuNorth,
                 imuUp,
@@ -936,6 +1112,7 @@ public class MainActivity extends AppCompatActivity {
             }
         }
         trajectoryView.setTrack(trackPoints);
+        pushTrackToMap();
         updateAllViews();
     }
 
@@ -966,6 +1143,10 @@ public class MainActivity extends AppCompatActivity {
         headerConnection.setText("● " + status.connectionState);
         headerConnection.setTextColor(connectionColor);
         headerSubtitle.setText(currentMode() + " | " + Formatters.oneDecimal(status.dataRateHz) + " Hz | 包: " + status.packetCount);
+        if (mapStatusText != null) {
+            mapStatusText.setText("● " + status.connectionState + " | " + Formatters.oneDecimal(status.dataRateHz) + " Hz | 包: " + status.packetCount);
+            mapStatusText.setTextColor(connectionColor);
+        }
 
         if (point == null) {
             speedValue.setText("--");
@@ -981,6 +1162,9 @@ public class MainActivity extends AppCompatActivity {
             latValue.setText("--");
             lonValue.setText("--");
             altitudeValue.setText("--");
+            if (mapInfoText != null) {
+                mapInfoText.setText("速度 --   距离 0.0 m   航向 --");
+            }
         } else {
             speedValue.setText(Formatters.speed(point.speed));
             distanceValue.setText(Formatters.oneDecimal(totalDistance) + " m");
@@ -995,6 +1179,11 @@ public class MainActivity extends AppCompatActivity {
             latValue.setText(Formatters.optional(point.latitude, 6));
             lonValue.setText(Formatters.optional(point.longitude, 6));
             altitudeValue.setText(point.altitude == null ? "--" : Formatters.meters(point.altitude));
+            if (mapInfoText != null) {
+                mapInfoText.setText("速度 " + Formatters.speed(point.speed)
+                        + "   距离 " + Formatters.oneDecimal(totalDistance) + " m"
+                        + "   航向 " + Formatters.degrees(point.yaw));
+            }
         }
 
         startButton.setEnabled(connected && receivingPaused && !fileReading);
@@ -1028,12 +1217,153 @@ public class MainActivity extends AppCompatActivity {
         return transportSpinner == null ? "TCP Client" : String.valueOf(transportSpinner.getSelectedItem());
     }
 
+    private void pushTrackToMap() {
+        if (aMap == null) {
+            return;
+        }
+        List<LatLng> latLngs = new ArrayList<>();
+        for (TrackPoint point : trackPoints) {
+            if (point.latitude == null || point.longitude == null) {
+                continue;
+            }
+            if (!Double.isFinite(point.latitude) || !Double.isFinite(point.longitude)) {
+                continue;
+            }
+            latLngs.add(new LatLng(point.latitude, point.longitude));
+        }
+        mapHasTrack = !latLngs.isEmpty();
+        if (mapEmptyText != null) {
+            mapEmptyText.setVisibility(mapHasTrack ? View.GONE : View.VISIBLE);
+            mapEmptyText.setText(mapHasTrack ? "" : "等待轨迹数据，IMU/ENU 将按参考原点映射到地图");
+        }
+        if (!mapHasTrack) {
+            return;
+        }
+        if (amapPolyline == null) {
+            amapPolyline = aMap.addPolyline(new PolylineOptions()
+                    .addAll(latLngs)
+                    .width(dp(5))
+                    .color(COLOR_BLUE));
+        } else {
+            amapPolyline.setPoints(latLngs);
+        }
+        LatLng current = latLngs.get(latLngs.size() - 1);
+        if (amapMarker == null) {
+            amapMarker = aMap.addMarker(new MarkerOptions()
+                    .position(current)
+                    .icon(BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_GREEN))
+                    .title("当前位置"));
+        } else {
+            amapMarker.setPosition(current);
+        }
+        if (latLngs.size() == 1) {
+            aMap.animateCamera(CameraUpdateFactory.newLatLngZoom(current, 18f));
+        } else {
+            LatLngBounds.Builder builder = LatLngBounds.builder();
+            for (LatLng latLng : latLngs) {
+                builder.include(latLng);
+            }
+            aMap.animateCamera(CameraUpdateFactory.newLatLngBounds(builder.build(), dp(48)));
+        }
+    }
+
+    private void clearMapTrack() {
+        mapHasTrack = false;
+        if (mapEmptyText != null) {
+            mapEmptyText.setVisibility(View.VISIBLE);
+            mapEmptyText.setText("等待轨迹数据，IMU/ENU 将按参考原点映射到地图");
+        }
+        if (amapPolyline != null) {
+            amapPolyline.remove();
+            amapPolyline = null;
+        }
+        if (amapMarker != null) {
+            amapMarker.remove();
+            amapMarker = null;
+        }
+    }
+
     private String currentProtocol() {
         return protocolSpinner == null ? "IMU CSV" : String.valueOf(protocolSpinner.getSelectedItem());
     }
 
     private String currentMode() {
         return modeSpinner == null ? status.mode : String.valueOf(modeSpinner.getSelectedItem());
+    }
+
+    private boolean applyReferenceFromInputs() {
+        try {
+            double latitude = Double.parseDouble(referenceLatInput.getText().toString().trim());
+            double longitude = Double.parseDouble(referenceLonInput.getText().toString().trim());
+            double altitude = Double.parseDouble(referenceAltInput.getText().toString().trim());
+            if (!Double.isFinite(latitude) || !Double.isFinite(longitude) || !Double.isFinite(altitude)) {
+                throw new NumberFormatException("参考原点包含非法数字");
+            }
+            if (latitude < -90.0 || latitude > 90.0 || longitude < -180.0 || longitude > 180.0) {
+                appendLog("ERROR 参考原点经纬度范围不正确");
+                return false;
+            }
+            referenceLatitude = latitude;
+            referenceLongitude = longitude;
+            referenceAltitude = altitude;
+            if (!referenceInitializedFromInput) {
+                appendLog("INFO 地图参考原点: "
+                        + Formatters.optional(referenceLatitude, 6)
+                        + ", "
+                        + Formatters.optional(referenceLongitude, 6)
+                        + ", "
+                        + Formatters.optional(referenceAltitude, 1)
+                        + "m");
+                referenceInitializedFromInput = true;
+            }
+            return true;
+        } catch (NumberFormatException error) {
+            appendLog("ERROR 参考原点必须是数字");
+            return false;
+        }
+    }
+
+    private void loadSettings() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        hostInput.setText(prefs.getString("host", "192.168.16.254"));
+        portInput.setText(prefs.getString("port", "8000"));
+        referenceLatInput.setText(prefs.getString("reference_latitude", "30.659462"));
+        referenceLonInput.setText(prefs.getString("reference_longitude", "104.065735"));
+        referenceAltInput.setText(prefs.getString("reference_altitude", "482.0"));
+        setSpinnerValue(transportSpinner, prefs.getString("transport", "TCP Client"));
+        setSpinnerValue(protocolSpinner, prefs.getString("protocol", "IMU CSV"));
+        setSpinnerValue(modeSpinner, prefs.getString("mode", "IMU 解算模式"));
+        applyReferenceFromInputs();
+        updateTransportUi();
+    }
+
+    private void saveSettings() {
+        if (hostInput == null || portInput == null) {
+            return;
+        }
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .edit()
+                .putString("host", hostInput.getText().toString())
+                .putString("port", portInput.getText().toString())
+                .putString("transport", currentTransport())
+                .putString("protocol", currentProtocol())
+                .putString("mode", currentMode())
+                .putString("reference_latitude", referenceLatInput.getText().toString())
+                .putString("reference_longitude", referenceLonInput.getText().toString())
+                .putString("reference_altitude", referenceAltInput.getText().toString())
+                .apply();
+    }
+
+    private void setSpinnerValue(Spinner spinner, String value) {
+        if (spinner == null || value == null) {
+            return;
+        }
+        for (int i = 0; i < spinner.getCount(); i++) {
+            if (value.equals(String.valueOf(spinner.getItemAtPosition(i)))) {
+                spinner.setSelection(i);
+                return;
+            }
+        }
     }
 
     private void exportLatestRecording() {
@@ -1132,18 +1462,37 @@ public class MainActivity extends AppCompatActivity {
 
     private void showTrajectoryPage() {
         trajectoryPage.setVisibility(View.VISIBLE);
+        mapPage.setVisibility(View.GONE);
         devicePage.setVisibility(View.GONE);
         trajectoryTab.setTextColor(Color.WHITE);
         trajectoryTab.setBackground(plainDrawable(COLOR_BLUE, COLOR_BLUE, dp(8)));
+        mapTab.setTextColor(COLOR_MUTED);
+        mapTab.setBackground(plainDrawable(Color.WHITE, COLOR_BORDER, dp(8)));
         deviceTab.setTextColor(COLOR_MUTED);
         deviceTab.setBackground(plainDrawable(Color.WHITE, COLOR_BORDER, dp(8)));
     }
 
+    private void showMapPage() {
+        trajectoryPage.setVisibility(View.GONE);
+        mapPage.setVisibility(View.VISIBLE);
+        devicePage.setVisibility(View.GONE);
+        trajectoryTab.setTextColor(COLOR_MUTED);
+        trajectoryTab.setBackground(plainDrawable(Color.WHITE, COLOR_BORDER, dp(8)));
+        mapTab.setTextColor(Color.WHITE);
+        mapTab.setBackground(plainDrawable(COLOR_BLUE, COLOR_BLUE, dp(8)));
+        deviceTab.setTextColor(COLOR_MUTED);
+        deviceTab.setBackground(plainDrawable(Color.WHITE, COLOR_BORDER, dp(8)));
+        pushTrackToMap();
+    }
+
     private void showDevicePage() {
         trajectoryPage.setVisibility(View.GONE);
+        mapPage.setVisibility(View.GONE);
         devicePage.setVisibility(View.VISIBLE);
         trajectoryTab.setTextColor(COLOR_MUTED);
         trajectoryTab.setBackground(plainDrawable(Color.WHITE, COLOR_BORDER, dp(8)));
+        mapTab.setTextColor(COLOR_MUTED);
+        mapTab.setBackground(plainDrawable(Color.WHITE, COLOR_BORDER, dp(8)));
         deviceTab.setTextColor(Color.WHITE);
         deviceTab.setBackground(plainDrawable(COLOR_BLUE, COLOR_BLUE, dp(8)));
     }
