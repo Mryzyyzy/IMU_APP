@@ -1879,10 +1879,6 @@ public class MainActivity extends AppCompatActivity {
         return normalized < 0.0 ? normalized + 360.0 : normalized;
     }
 
-    private double clamp(double value, double min, double max) {
-        return Math.max(min, Math.min(max, value));
-    }
-
     private class TcpEvents implements TcpClient.Listener {
         @Override
         public void onConnected() {
