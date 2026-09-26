@@ -1,20 +1,32 @@
 package com.example.imu_app;
 
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
 import androidx.core.content.FileProvider;
+import androidx.core.content.ContextCompat;
 
+import android.Manifest;
+import android.content.ClipData;
+import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.database.Cursor;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.StateListDrawable;
+import android.location.Location;
+import android.location.LocationListener;
+import android.location.LocationManager;
 import android.net.Uri;
 import android.os.Bundle;
 import android.provider.OpenableColumns;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
@@ -53,6 +65,8 @@ import com.example.imu_app.util.Formatters;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -61,6 +75,8 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 public class MainActivity extends AppCompatActivity {
     private static final int COLOR_PAGE = Color.rgb(238, 243, 248);
@@ -73,13 +89,18 @@ public class MainActivity extends AppCompatActivity {
     private static final int COLOR_MUTED = Color.rgb(118, 131, 152);
     private static final int MAX_TRACK_POINTS = 5000;
     private static final int REQUEST_OPEN_DATA_FILE = 3101;
+    private static final int REQUEST_LOCATION_PERMISSION = 3102;
     private static final int FILE_REPLAY_DELAY_MS = 35;
     private static final long UI_UPDATE_INTERVAL_MS = 50L;
     private static final long TRAJECTORY_UPDATE_INTERVAL_MS = 50L;
     private static final long MAP_UPDATE_INTERVAL_MS = 200L;
     private static final long MAP_CAMERA_INTERVAL_MS = 1000L;
+    private static final long RAW_LINE_UPDATE_INTERVAL_MS = 100L;
     private static final String PREFS_NAME = "imu_mobile_settings";
     private static final String AMAP_KEY = "0e8026cdfbf451fb8988af4207a0a509";
+    private static final double DEFAULT_REFERENCE_LATITUDE = 30.659462;
+    private static final double DEFAULT_REFERENCE_LONGITUDE = 104.065735;
+    private static final double DEFAULT_REFERENCE_ALTITUDE = 482.0;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final AppStatus status = new AppStatus();
@@ -99,6 +120,9 @@ public class MainActivity extends AppCompatActivity {
     private LinearLayout mapPage;
     private LinearLayout devicePage;
     private TrajectoryView trajectoryView;
+    private LinearLayout.LayoutParams trajectoryViewParams;
+    private float trajectoryResizeStartY = 0f;
+    private int trajectoryResizeStartHeight = 0;
     private Bundle mapSavedInstanceState;
     private MapView amapMapView;
     private AMap aMap;
@@ -109,6 +133,7 @@ public class MainActivity extends AppCompatActivity {
     private TextView mapEmptyText;
     private boolean amapLoaded = false;
     private boolean mapHasTrack = false;
+    private boolean mapUserZoomLocked = false;
 
     private TextView headerConnection;
     private TextView headerSubtitle;
@@ -147,6 +172,7 @@ public class MainActivity extends AppCompatActivity {
     private Spinner modeSpinner;
     private Spinner algorithmSpinner;
     private Button connectButton;
+    private LinearLayout endpointRow;
     private LinearLayout hostRow;
     private LinearLayout portRow;
     private LinearLayout fileRow;
@@ -154,12 +180,14 @@ public class MainActivity extends AppCompatActivity {
     private Uri selectedFileUri;
     private Thread fileReaderThread;
     private final List<TrackPoint> fileReplayPoints = new ArrayList<>();
+    private final List<String> fileReplayRawLines = new ArrayList<>();
     private Runnable fileReplayRunnable;
     private int fileReplayIndex = 0;
+    private boolean fileReplayRawAlreadyRecorded = false;
 
     private boolean connected = false;
     private volatile boolean fileReading = false;
-    private boolean receivingPaused = false;
+    private volatile boolean receivingPaused = false;
     private boolean recording = false;
     private double totalDistance = 0.0;
     private TrackPoint previousPoint;
@@ -171,10 +199,11 @@ public class MainActivity extends AppCompatActivity {
     private long lastTrajectoryUpdateMillis = 0L;
     private long lastMapUpdateMillis = 0L;
     private long lastMapCameraMoveMillis = 0L;
+    private long lastRawLineUpdateMillis = 0L;
 
-    private double referenceLatitude = 30.659462;
-    private double referenceLongitude = 104.065735;
-    private double referenceAltitude = 482.0;
+    private double referenceLatitude = DEFAULT_REFERENCE_LATITUDE;
+    private double referenceLongitude = DEFAULT_REFERENCE_LONGITUDE;
+    private double referenceAltitude = DEFAULT_REFERENCE_ALTITUDE;
     private boolean referenceInitializedFromInput = false;
 
     @Override
@@ -256,6 +285,19 @@ public class MainActivity extends AppCompatActivity {
         updateAllViews();
     }
 
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != REQUEST_LOCATION_PERMISSION) {
+            return;
+        }
+        if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            requestReferenceLocation();
+        } else {
+            appendLog("WARN 未授予定位权限，无法使用 GPS 设置参考原点");
+        }
+    }
+
     private void handleImportIntent(Intent intent) {
         if (intent == null) {
             return;
@@ -330,18 +372,34 @@ public class MainActivity extends AppCompatActivity {
 
         page.addView(buildHeaderCard(), matchWrap());
 
+        trajectoryViewParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(330)
+        );
+        trajectoryViewParams.setMargins(0, dp(10), 0, dp(5));
+
         trajectoryView = new TrajectoryView(this);
-        LinearLayout.LayoutParams trajectoryParams = new LinearLayout.LayoutParams(
+        trajectoryView.setBackground(cardDrawable());
+        page.addView(trajectoryView, trajectoryViewParams);
+        page.addView(buildTrajectoryResizeHandle(page), new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(18)
+        ));
+
+        ScrollView metricsScroll = new ScrollView(this);
+        metricsScroll.setFillViewport(false);
+        LinearLayout metricsContent = new LinearLayout(this);
+        metricsContent.setOrientation(LinearLayout.VERTICAL);
+        metricsScroll.addView(metricsContent);
+        LinearLayout.LayoutParams metricsScrollParams = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 0,
                 1f
         );
-        trajectoryParams.setMargins(0, dp(10), 0, dp(10));
-        trajectoryView.setBackground(cardDrawable());
-        page.addView(trajectoryView, trajectoryParams);
+        metricsScrollParams.setMargins(0, dp(5), 0, dp(10));
 
         LinearLayout metricGrid = card();
-        page.addView(metricGrid, matchWrap());
+        metricsContent.addView(metricGrid, matchWrap());
 
         LinearLayout row1 = horizontalRow();
         speedValue = addMetric(row1, "速度", "--");
@@ -355,8 +413,8 @@ public class MainActivity extends AppCompatActivity {
 
         LinearLayout detailGrid = card();
         LinearLayout.LayoutParams detailParams = matchWrap();
-        detailParams.setMargins(0, dp(10), 0, dp(10));
-        page.addView(detailGrid, detailParams);
+        detailParams.setMargins(0, dp(10), 0, 0);
+        metricsContent.addView(detailGrid, detailParams);
 
         LinearLayout row3 = horizontalRow();
         eastValue = addMetric(row3, "East", "--");
@@ -376,8 +434,53 @@ public class MainActivity extends AppCompatActivity {
         altitudeValue = addMetric(row5, "高度", "--");
         detailGrid.addView(row5, matchWrap());
 
+        page.addView(metricsScroll, metricsScrollParams);
         page.addView(buildControlBar(), matchWrap());
         return page;
+    }
+
+    private View buildTrajectoryResizeHandle(LinearLayout page) {
+        FrameLayout handle = new FrameLayout(this);
+        handle.setPadding(0, dp(5), 0, dp(5));
+        View grip = new View(this);
+        grip.setBackground(plainDrawable(Color.rgb(148, 163, 184), Color.TRANSPARENT, dp(3)));
+        FrameLayout.LayoutParams gripParams = new FrameLayout.LayoutParams(
+                dp(54),
+                dp(4),
+                Gravity.CENTER
+        );
+        handle.addView(grip, gripParams);
+        handle.setOnTouchListener((view, event) -> {
+            if (trajectoryViewParams == null) {
+                return false;
+            }
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    trajectoryResizeStartY = event.getRawY();
+                    trajectoryResizeStartHeight = trajectoryViewParams.height;
+                    view.setPressed(true);
+                    grip.setAlpha(0.65f);
+                    return true;
+                case MotionEvent.ACTION_MOVE:
+                    int delta = Math.round(event.getRawY() - trajectoryResizeStartY);
+                    int minHeight = dp(180);
+                    int maxHeight = Math.max(minHeight, page.getHeight() - dp(250));
+                    int nextHeight = Math.max(minHeight, Math.min(maxHeight, trajectoryResizeStartHeight + delta));
+                    if (trajectoryViewParams.height != nextHeight) {
+                        trajectoryViewParams.height = nextHeight;
+                        trajectoryView.setLayoutParams(trajectoryViewParams);
+                    }
+                    return true;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    view.setPressed(false);
+                    grip.setAlpha(1f);
+                    return true;
+                default:
+                    return false;
+            }
+        });
+        return handle;
     }
 
     private View buildHeaderCard() {
@@ -445,8 +548,11 @@ public class MainActivity extends AppCompatActivity {
         amapMapView = new MapView(this);
         amapMapView.onCreate(mapSavedInstanceState);
         aMap = amapMapView.getMap();
-        aMap.getUiSettings().setZoomControlsEnabled(true);
+        aMap.getUiSettings().setZoomControlsEnabled(false);
+        aMap.getUiSettings().setZoomGesturesEnabled(true);
         aMap.getUiSettings().setCompassEnabled(true);
+        aMap.getUiSettings().setScaleControlsEnabled(true);
+        aMap.setOnMapTouchListener(event -> mapUserZoomLocked = true);
         aMap.setOnMapLoadedListener(() -> {
             amapLoaded = true;
             if (mapHasTrack && mapEmptyText != null) {
@@ -490,16 +596,14 @@ public class MainActivity extends AppCompatActivity {
 
         LinearLayout page = new LinearLayout(this);
         page.setOrientation(LinearLayout.VERTICAL);
-        page.setPadding(dp(14), dp(12), dp(14), dp(12));
+        page.setPadding(dp(10), dp(8), dp(10), dp(8));
         page.setBackgroundColor(COLOR_PAGE);
         scrollView.addView(page);
 
         page.addView(buildDeviceSummary(), matchWrap());
-        page.addView(buildConnectionSettings(), sectionParams());
-        page.addView(buildModeSettings(), sectionParams());
-        page.addView(buildReferenceSettings(), sectionParams());
-        page.addView(buildRecentDataPanel(), sectionParams());
-        page.addView(buildLogPanel(), sectionParams());
+        page.addView(buildConnectionSettings(), compactSectionParams());
+        page.addView(buildReferenceSettings(), compactSectionParams());
+        page.addView(buildRuntimePanel(), compactSectionParams());
 
         LinearLayout wrapper = new LinearLayout(this);
         wrapper.setOrientation(LinearLayout.VERTICAL);
@@ -511,38 +615,45 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private View buildDeviceSummary() {
-        LinearLayout card = card();
-        TextView title = text("设备状态", 16, COLOR_TEXT, Typeface.BOLD);
-        deviceConnection = text("● 未连接", 15, COLOR_RED, Typeface.BOLD);
-        deviceEndpoint = text("192.168.16.254:8000", 13, COLOR_MUTED, Typeface.NORMAL);
-        deviceRuntime = text("等待 TCP 连接 | 0 Hz", 13, COLOR_MUTED, Typeface.NORMAL);
-        card.addView(title, matchWrap());
-        card.addView(deviceConnection, topMargin(8));
-        card.addView(deviceEndpoint, topMargin(4));
-        card.addView(deviceRuntime, topMargin(4));
+        LinearLayout card = compactCard();
+        LinearLayout row = horizontalRow();
+        TextView title = text("设备状态", 14, COLOR_TEXT, Typeface.BOLD);
+        deviceConnection = text("● 未连接", 13, COLOR_RED, Typeface.BOLD);
+        row.addView(title, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        row.addView(deviceConnection);
+        card.addView(row, matchWrap());
+
+        deviceEndpoint = text("192.168.16.254:8000", 12, COLOR_MUTED, Typeface.NORMAL);
+        deviceRuntime = text("等待 TCP 连接 | 0 Hz", 12, COLOR_MUTED, Typeface.NORMAL);
+        card.addView(deviceEndpoint, topMargin(3));
+        card.addView(deviceRuntime, topMargin(2));
         return card;
     }
 
     private View buildConnectionSettings() {
-        LinearLayout card = card();
-        card.addView(text("连接设置", 16, COLOR_TEXT, Typeface.BOLD), matchWrap());
+        LinearLayout card = compactCard();
+        card.addView(text("连接与算法", 14, COLOR_TEXT, Typeface.BOLD), matchWrap());
 
         transportSpinner = spinner(new String[]{"TCP Client", "文件读取 File"});
         hostInput = editText("192.168.16.254");
         portInput = editText("8000");
         protocolSpinner = spinner(new String[]{"IMU CSV", "Position CSV"});
+        modeSpinner = spinner(new String[]{"IMU 解算模式", "位置直显模式"});
+        algorithmSpinner = spinner(new String[]{"v1_matlab_port", "v2_pdr_turn_snap"});
         connectButton = primaryButton("连接");
         connectButton.setOnClickListener(v -> toggleTransportConnection());
 
-        card.addView(formRow("通信方式", transportSpinner), topMargin(10));
-        hostRow = formRow("Host", hostInput);
-        portRow = formRow("Port", portInput);
-        fileRow = formRow("文件", buildFilePickerControl());
-        card.addView(hostRow, topMargin(8));
-        card.addView(portRow, topMargin(8));
-        card.addView(fileRow, topMargin(8));
-        card.addView(formRow("协议", protocolSpinner), topMargin(8));
-        card.addView(connectButton, topMargin(12));
+        card.addView(compactFormRow("通信", transportSpinner), topMargin(6));
+        endpointRow = buildEndpointRow();
+        fileRow = compactFormRow("文件", buildFilePickerControl());
+        card.addView(endpointRow, topMargin(5));
+        card.addView(fileRow, topMargin(5));
+        card.addView(compactFormRow("协议", protocolSpinner), topMargin(5));
+        card.addView(compactFormRow("模式", modeSpinner), topMargin(5));
+        card.addView(compactFormRow("算法", algorithmSpinner), topMargin(5));
+        LinearLayout.LayoutParams buttonParams = topMargin(7);
+        buttonParams.height = dp(38);
+        card.addView(connectButton, buttonParams);
         transportSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
             @Override
             public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
@@ -562,16 +673,33 @@ public class MainActivity extends AppCompatActivity {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        filePathView = text("未选择文件", 13, COLOR_MUTED, Typeface.NORMAL);
+        filePathView = text("未选择文件", 12, COLOR_MUTED, Typeface.NORMAL);
         filePathView.setSingleLine(true);
-        filePathView.setPadding(dp(10), 0, dp(10), 0);
+        filePathView.setPadding(dp(8), 0, dp(8), 0);
         filePathView.setBackground(plainDrawable(Color.rgb(248, 250, 252), COLOR_BORDER, dp(6)));
         Button chooseButton = smallButton("选择");
         chooseButton.setOnClickListener(v -> openFilePicker());
         row.addView(filePathView, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f));
-        LinearLayout.LayoutParams buttonParams = new LinearLayout.LayoutParams(dp(64), LinearLayout.LayoutParams.MATCH_PARENT);
-        buttonParams.setMargins(dp(8), 0, 0, 0);
+        LinearLayout.LayoutParams buttonParams = new LinearLayout.LayoutParams(dp(56), LinearLayout.LayoutParams.MATCH_PARENT);
+        buttonParams.setMargins(dp(6), 0, 0, 0);
         row.addView(chooseButton, buttonParams);
+        return row;
+    }
+
+    private LinearLayout buildEndpointRow() {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        TextView labelView = text("地址", 12, COLOR_MUTED, Typeface.NORMAL);
+        row.addView(labelView, new LinearLayout.LayoutParams(dp(48), LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout inputs = new LinearLayout(this);
+        inputs.setOrientation(LinearLayout.HORIZONTAL);
+        inputs.addView(hostInput, new LinearLayout.LayoutParams(0, dp(36), 1f));
+        LinearLayout.LayoutParams portParams = new LinearLayout.LayoutParams(dp(78), dp(36));
+        portParams.setMargins(dp(6), 0, 0, 0);
+        inputs.addView(portInput, portParams);
+        row.addView(inputs, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         return row;
     }
 
@@ -586,16 +714,79 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private View buildReferenceSettings() {
-        LinearLayout card = card();
-        card.addView(text("地图参考原点", 16, COLOR_TEXT, Typeface.BOLD), matchWrap());
-        TextView hint = text("用于把 IMU/ENU 局部轨迹换算到高德地图", 12, COLOR_MUTED, Typeface.NORMAL);
-        card.addView(hint, topMargin(6));
-        referenceLatInput = editText("30.659462");
-        referenceLonInput = editText("104.065735");
-        referenceAltInput = editText("482.0");
-        card.addView(formRow("纬度", referenceLatInput), topMargin(10));
-        card.addView(formRow("经度", referenceLonInput), topMargin(8));
-        card.addView(formRow("高度", referenceAltInput), topMargin(8));
+        LinearLayout card = compactCard();
+        LinearLayout titleRow = horizontalRow();
+        titleRow.addView(text("地图参考原点", 14, COLOR_TEXT, Typeface.BOLD), new LinearLayout.LayoutParams(
+                0,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                1f
+        ));
+        Button gpsButton = smallButton("GPS定位");
+        gpsButton.setOnClickListener(v -> locateReferenceWithGps());
+        Button defaultButton = smallButton("默认定位");
+        defaultButton.setOnClickListener(v -> applyDefaultReferenceLocation());
+        titleRow.addView(gpsButton, new LinearLayout.LayoutParams(dp(76), dp(32)));
+        LinearLayout.LayoutParams defaultButtonParams = new LinearLayout.LayoutParams(dp(76), dp(32));
+        defaultButtonParams.setMargins(dp(6), 0, 0, 0);
+        titleRow.addView(defaultButton, defaultButtonParams);
+        card.addView(titleRow, matchWrap());
+        referenceLatInput = editText(String.valueOf(DEFAULT_REFERENCE_LATITUDE));
+        referenceLonInput = editText(String.valueOf(DEFAULT_REFERENCE_LONGITUDE));
+        referenceAltInput = editText(String.valueOf(DEFAULT_REFERENCE_ALTITUDE));
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.addView(compactStackField("纬度", referenceLatInput), compactFieldParams(0));
+        row.addView(compactStackField("经度", referenceLonInput), compactFieldParams(dp(6)));
+        row.addView(compactStackField("高度", referenceAltInput), compactFieldParams(dp(6)));
+        card.addView(row, topMargin(6));
+        return card;
+    }
+
+    private View buildRuntimePanel() {
+        LinearLayout card = compactCard();
+        LinearLayout titleRow = horizontalRow();
+        titleRow.addView(text("运行状态", 14, COLOR_TEXT, Typeface.BOLD), new LinearLayout.LayoutParams(
+                0,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                1f
+        ));
+        Button clearLog = smallButton("清空日志");
+        clearLog.setOnClickListener(v -> {
+            logs.clear();
+            updateLogText();
+        });
+        titleRow.addView(clearLog, new LinearLayout.LayoutParams(dp(76), dp(32)));
+        card.addView(titleRow, matchWrap());
+
+        recentRawText = text("原始行: --", 11, COLOR_MUTED, Typeface.NORMAL);
+        recentRawText.setSingleLine(false);
+        recentRawText.setMaxLines(2);
+        recentRawText.setTypeface(Typeface.MONOSPACE);
+        recentTrackText = text("轨迹点: --", 11, COLOR_MUTED, Typeface.NORMAL);
+        recentTrackText.setSingleLine(true);
+        recentTrackText.setTypeface(Typeface.MONOSPACE);
+        latestRecordText = text("记录文件: 无", 11, COLOR_MUTED, Typeface.NORMAL);
+        latestRecordText.setSingleLine(true);
+        Button exportButton = smallButton("导出");
+        exportRecordButton = exportButton;
+        exportButton.setOnClickListener(v -> exportLatestRecording());
+
+        card.addView(recentRawText, topMargin(5));
+        card.addView(recentTrackText, topMargin(3));
+        LinearLayout recordRow = horizontalRow();
+        recordRow.addView(latestRecordText, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        recordRow.addView(exportButton, new LinearLayout.LayoutParams(dp(56), dp(32)));
+        card.addView(recordRow, topMargin(3));
+
+        logText = text("", 11, COLOR_TEXT, Typeface.NORMAL);
+        logText.setTypeface(Typeface.MONOSPACE);
+        ScrollView logScroll = new ScrollView(this);
+        logScroll.setBackground(plainDrawable(Color.rgb(248, 250, 252), COLOR_BORDER, dp(6)));
+        logScroll.setPadding(dp(8), dp(5), dp(8), dp(5));
+        logScroll.addView(logText);
+        LinearLayout.LayoutParams logParams = topMargin(5);
+        logParams.height = dp(86);
+        card.addView(logScroll, logParams);
         return card;
     }
 
@@ -745,13 +936,22 @@ public class MainActivity extends AppCompatActivity {
                 throw new IOException("无法打开文件输入流");
             }
             String line;
-            while (fileReading && !Thread.currentThread().isInterrupted() && (line = reader.readLine()) != null) {
+            while (fileReading && !Thread.currentThread().isInterrupted()) {
+                if (receivingPaused) {
+                    Thread.sleep(FILE_REPLAY_DELAY_MS);
+                    continue;
+                }
+                line = reader.readLine();
+                if (line == null) {
+                    break;
+                }
                 String frame = line.trim();
                 if (frame.isEmpty()) {
                     continue;
                 }
                 lineCount++;
                 String finalFrame = frame;
+                handler.post(() -> updateRecentRawLine(finalFrame));
                 handler.post(() -> handleIncomingLine(finalFrame));
                 Thread.sleep(FILE_REPLAY_DELAY_MS);
             }
@@ -790,30 +990,47 @@ public class MainActivity extends AppCompatActivity {
 
     private void processImuFileBatch(Uri uri) {
         List<ImuSample> samples = new ArrayList<>();
+        List<String> rawFrames = new ArrayList<>();
         int lineCount = 0;
         int parseErrors = 0;
         Integer firstPacketId = null;
+        boolean rawRecordedDuringBatch = false;
         try (InputStream stream = getContentResolver().openInputStream(uri);
              BufferedReader reader = stream == null ? null : new BufferedReader(new InputStreamReader(stream))) {
             if (reader == null) {
                 throw new IOException("无法打开文件输入流");
             }
             String line;
-            while (fileReading && !Thread.currentThread().isInterrupted() && (line = reader.readLine()) != null) {
+            while (fileReading && !Thread.currentThread().isInterrupted()) {
+                if (receivingPaused) {
+                    Thread.sleep(FILE_REPLAY_DELAY_MS);
+                    continue;
+                }
+                line = reader.readLine();
+                if (line == null) {
+                    break;
+                }
                 String frame = line.trim();
                 if (frame.isEmpty()) {
                     continue;
                 }
                 lineCount++;
+                if (lineCount == 1 || lineCount % 50 == 0) {
+                    String finalFrame = frame;
+                    handler.post(() -> updateRecentRawLine(finalFrame));
+                }
                 try {
                     int packetId = packetIdFromLine(frame);
                     if (firstPacketId == null) {
                         firstPacketId = packetId;
                     }
                     long timestampMillis = Math.round((packetId - firstPacketId) * 1000.0 / 100.0);
-                    samples.add(imuParser.parse(frame, timestampMillis));
+                    ImuSample sample = imuParser.parse(frame, timestampMillis);
+                    samples.add(sample);
+                    rawFrames.add(frame);
                     if (recording) {
                         trackRecorder.recordRaw(frame);
+                        rawRecordedDuringBatch = true;
                     }
                 } catch (ProtocolParseException | IOException error) {
                     parseErrors++;
@@ -823,8 +1040,10 @@ public class MainActivity extends AppCompatActivity {
                 return;
             }
             List<TrackPoint> points = imuNavigationProcessor.processBatch(samples);
+            List<String> replayRawLines = buildReplayRawLines(points, samples, rawFrames);
             int finalLineCount = lineCount;
             int finalParseErrors = parseErrors;
+            boolean finalRawRecordedDuringBatch = rawRecordedDuringBatch;
             handler.post(() -> {
                 if (!fileReading) {
                     return;
@@ -834,7 +1053,7 @@ public class MainActivity extends AppCompatActivity {
                         + ", samples=" + samples.size()
                         + ", track_points=" + points.size()
                         + ", parse_errors=" + finalParseErrors);
-                startFileTrackReplay(points);
+                startFileTrackReplay(points, replayRawLines, finalRawRecordedDuringBatch);
             });
         } catch (Exception error) {
             if (!fileReading) {
@@ -904,12 +1123,24 @@ public class MainActivity extends AppCompatActivity {
 
     private void resumeReceiving() {
         if (!connected) {
-            appendLog("WARN 尚未连接 TCP");
+            appendLog("WARN 当前没有可继续的数据源");
             return;
         }
         receivingPaused = false;
         status.running = true;
-        status.message = "接收中";
+        if (fileReading) {
+            status.connectionState = fileReplayRunnable == null ? "读取中" : "文件回放";
+            status.message = fileReplayRunnable == null
+                    ? "文件读取继续"
+                    : "文件回放运行：" + fileReplayIndex + "/" + fileReplayPoints.size() + " 个轨迹点";
+            if (fileReplayRunnable != null) {
+                handler.removeCallbacks(fileReplayRunnable);
+                handler.post(fileReplayRunnable);
+            }
+        } else {
+            status.connectionState = "已连接";
+            status.message = "接收中";
+        }
         appendLog("继续接收数据");
         updateAllViews();
     }
@@ -920,8 +1151,11 @@ public class MainActivity extends AppCompatActivity {
         }
         receivingPaused = true;
         status.running = false;
-        status.message = "已暂停显示";
-        appendLog("已暂停显示，TCP 连接保持");
+        if (fileReading && fileReplayRunnable != null) {
+            handler.removeCallbacks(fileReplayRunnable);
+        }
+        status.message = fileReading ? "已暂停文件读取" : "已暂停接收";
+        appendLog(fileReading ? "已暂停文件读取/回放" : "已暂停接收，TCP 连接保持");
         updateAllViews();
     }
 
@@ -978,6 +1212,7 @@ public class MainActivity extends AppCompatActivity {
         lastTrajectoryUpdateMillis = 0L;
         lastMapUpdateMillis = 0L;
         lastMapCameraMoveMillis = 0L;
+        lastRawLineUpdateMillis = 0L;
         resetImuNavigationProcessor();
         referenceInitializedFromInput = false;
         if (recentRawText != null) {
@@ -997,9 +1232,7 @@ public class MainActivity extends AppCompatActivity {
         if (receivingPaused) {
             return;
         }
-        if (recentRawText != null) {
-            recentRawText.setText("原始行: " + trimForDisplay(line, 96));
-        }
+        updateRecentRawLine(line);
         if (recording) {
             try {
                 trackRecorder.recordRaw(line);
@@ -1030,6 +1263,18 @@ public class MainActivity extends AppCompatActivity {
                 appendLog("ERROR 解析失败: " + error.getMessage());
             }
         }
+    }
+
+    private void updateRecentRawLine(String line) {
+        if (recentRawText == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (lastRawLineUpdateMillis != 0L && now - lastRawLineUpdateMillis < RAW_LINE_UPDATE_INTERVAL_MS) {
+            return;
+        }
+        lastRawLineUpdateMillis = now;
+        recentRawText.setText("原始行: " + trimForDisplay(line, 140));
     }
 
     private TrackPoint trackPointFromPosition(PositionFix fix) {
@@ -1145,7 +1390,27 @@ public class MainActivity extends AppCompatActivity {
         updateLiveViewsThrottled();
     }
 
-    private void startFileTrackReplay(List<TrackPoint> points) {
+    private List<String> buildReplayRawLines(List<TrackPoint> points, List<ImuSample> samples, List<String> rawFrames) {
+        List<String> replayRawLines = new ArrayList<>();
+        if (points.isEmpty() || samples.isEmpty() || rawFrames.isEmpty()) {
+            return replayRawLines;
+        }
+        int sampleIndex = 0;
+        for (TrackPoint point : points) {
+            while (sampleIndex + 1 < samples.size()) {
+                long currentDiff = Math.abs(samples.get(sampleIndex).timestampMillis - point.timestampMillis);
+                long nextDiff = Math.abs(samples.get(sampleIndex + 1).timestampMillis - point.timestampMillis);
+                if (nextDiff > currentDiff) {
+                    break;
+                }
+                sampleIndex++;
+            }
+            replayRawLines.add(sampleIndex < rawFrames.size() ? rawFrames.get(sampleIndex) : null);
+        }
+        return replayRawLines;
+    }
+
+    private void startFileTrackReplay(List<TrackPoint> points, List<String> rawLines, boolean rawAlreadyRecorded) {
         stopFileReplayTimer();
         trackPoints.clear();
         totalDistance = 0.0;
@@ -1154,7 +1419,10 @@ public class MainActivity extends AppCompatActivity {
         trajectoryView.clear();
         fileReplayPoints.clear();
         fileReplayPoints.addAll(points);
+        fileReplayRawLines.clear();
+        fileReplayRawLines.addAll(rawLines);
         fileReplayIndex = 0;
+        fileReplayRawAlreadyRecorded = rawAlreadyRecorded;
         status.packetCount = 0;
         framesSinceRateUpdate = 0;
         lastRateUpdateMillis = 0L;
@@ -1190,11 +1458,25 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void replayNextFilePoint() {
+        if (receivingPaused) {
+            status.running = false;
+            status.message = "已暂停文件回放：" + fileReplayIndex + "/" + fileReplayPoints.size() + " 个轨迹点";
+            updateAllViews();
+            return;
+        }
         if (!fileReading || fileReplayIndex >= fileReplayPoints.size()) {
             finishFileTrackReplay();
             return;
         }
-        TrackPoint point = fileReplayPoints.get(fileReplayIndex);
+        int replayIndex = fileReplayIndex;
+        TrackPoint point = fileReplayPoints.get(replayIndex);
+        if (replayIndex < fileReplayRawLines.size()) {
+            String rawLine = fileReplayRawLines.get(replayIndex);
+            if (rawLine != null) {
+                updateRecentRawLine(rawLine);
+                recordReplayRawLineIfNeeded(rawLine);
+            }
+        }
         fileReplayIndex++;
         status.packetCount = fileReplayIndex;
         status.dataRateHz = 1000.0 / FILE_REPLAY_DELAY_MS;
@@ -1208,6 +1490,18 @@ public class MainActivity extends AppCompatActivity {
         }
         if (fileReplayRunnable != null) {
             handler.postDelayed(fileReplayRunnable, FILE_REPLAY_DELAY_MS);
+        }
+    }
+
+    private void recordReplayRawLineIfNeeded(String rawLine) {
+        if (!recording || fileReplayRawAlreadyRecorded) {
+            return;
+        }
+        try {
+            trackRecorder.recordRaw(rawLine);
+        } catch (IOException error) {
+            appendLog("ERROR 写入回放原始记录失败: " + error.getMessage());
+            stopRecordingIfNeeded(true);
         }
     }
 
@@ -1372,16 +1666,19 @@ public class MainActivity extends AppCompatActivity {
             }
         }
 
-        startButton.setEnabled(connected && receivingPaused && !fileReading);
-        pauseButton.setEnabled(connected && !receivingPaused && !fileReading);
+        startButton.setEnabled(connected && receivingPaused);
+        pauseButton.setEnabled(connected && !receivingPaused);
+        startButton.setAlpha(startButton.isEnabled() ? 1f : 0.45f);
+        pauseButton.setAlpha(pauseButton.isEnabled() ? 1f : 0.45f);
         recordButton.setText(recording ? "停止记录" : "记录");
-        recordButton.setBackground(plainDrawable(recording ? COLOR_RED : Color.WHITE, COLOR_RED, dp(6)));
+        recordButton.setBackground(buttonDrawable(recording ? COLOR_RED : Color.WHITE, COLOR_RED, dp(6)));
         recordButton.setTextColor(recording ? Color.WHITE : COLOR_RED);
         if (latestRecordText != null) {
             latestRecordText.setText("记录文件: " + trackRecorder.latestSummary());
         }
         if (exportRecordButton != null) {
             exportRecordButton.setEnabled(!trackRecorder.latestFiles().isEmpty());
+            exportRecordButton.setAlpha(exportRecordButton.isEnabled() ? 1f : 0.45f);
         }
 
         deviceConnection.setText("● " + status.connectionState);
@@ -1442,6 +1739,9 @@ public class MainActivity extends AppCompatActivity {
         } else {
             amapMarker.setPosition(current);
         }
+        if (mapUserZoomLocked && !forceMoveCamera) {
+            return;
+        }
         long now = System.currentTimeMillis();
         boolean shouldMoveCamera = forceMoveCamera || lastMapCameraMoveMillis == 0L || now - lastMapCameraMoveMillis >= MAP_CAMERA_INTERVAL_MS;
         if (!shouldMoveCamera) {
@@ -1461,6 +1761,7 @@ public class MainActivity extends AppCompatActivity {
 
     private void clearMapTrack() {
         mapHasTrack = false;
+        mapUserZoomLocked = false;
         if (mapEmptyText != null) {
             mapEmptyText.setVisibility(View.VISIBLE);
             mapEmptyText.setText("等待轨迹数据，IMU/ENU 将按参考原点映射到地图");
@@ -1486,6 +1787,127 @@ public class MainActivity extends AppCompatActivity {
     private String currentAlgorithmVersion() {
         String value = algorithmSpinner == null ? ImuNavigationProcessor.V1_MATLAB_PORT : String.valueOf(algorithmSpinner.getSelectedItem());
         return ImuNavigationProcessor.normalizeAlgorithmVersion(value);
+    }
+
+    private void locateReferenceWithGps() {
+        if (!hasLocationPermission()) {
+            ActivityCompat.requestPermissions(
+                    this,
+                    new String[]{Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION},
+                    REQUEST_LOCATION_PERMISSION
+            );
+            return;
+        }
+        requestReferenceLocation();
+    }
+
+    private boolean hasLocationPermission() {
+        return ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                || ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void requestReferenceLocation() {
+        LocationManager locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+        if (locationManager == null) {
+            appendLog("ERROR 系统定位服务不可用");
+            return;
+        }
+        try {
+            Location lastLocation = bestLastKnownLocation(locationManager);
+            if (lastLocation != null) {
+                applyReferenceLocation(lastLocation, "最近定位");
+            }
+
+            String provider = null;
+            if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+                provider = LocationManager.GPS_PROVIDER;
+            } else if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
+                provider = LocationManager.NETWORK_PROVIDER;
+            }
+            if (provider == null) {
+                appendLog("WARN 请先打开手机定位服务");
+                return;
+            }
+            appendLog("INFO 正在获取 GPS 参考原点...");
+            locationManager.requestSingleUpdate(provider, new LocationListener() {
+                @Override
+                public void onLocationChanged(Location location) {
+                    applyReferenceLocation(location, "GPS定位");
+                }
+
+                @Override
+                public void onStatusChanged(String provider, int status, Bundle extras) {
+                }
+
+                @Override
+                public void onProviderEnabled(String provider) {
+                }
+
+                @Override
+                public void onProviderDisabled(String provider) {
+                    appendLog("WARN 定位服务已关闭");
+                }
+            }, Looper.getMainLooper());
+        } catch (SecurityException error) {
+            appendLog("ERROR 定位权限不可用: " + error.getMessage());
+        } catch (IllegalArgumentException error) {
+            appendLog("ERROR 定位提供方不可用: " + error.getMessage());
+        }
+    }
+
+    private Location bestLastKnownLocation(LocationManager locationManager) {
+        Location best = null;
+        for (String provider : new String[]{LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER}) {
+            try {
+                if (!locationManager.isProviderEnabled(provider)) {
+                    continue;
+                }
+                Location location = locationManager.getLastKnownLocation(provider);
+                if (location != null && (best == null || location.getTime() > best.getTime())) {
+                    best = location;
+                }
+            } catch (SecurityException | IllegalArgumentException ignored) {
+                // Permission and provider availability are handled by the caller.
+            }
+        }
+        return best;
+    }
+
+    private void applyReferenceLocation(Location location, String source) {
+        double altitude = location.hasAltitude() ? location.getAltitude() : referenceAltitude;
+        referenceLatInput.setText(String.format(Locale.US, "%.6f", location.getLatitude()));
+        referenceLonInput.setText(String.format(Locale.US, "%.6f", location.getLongitude()));
+        referenceAltInput.setText(String.format(Locale.US, "%.1f", altitude));
+        applyReferenceInputsFromUi(source);
+    }
+
+    private void applyDefaultReferenceLocation() {
+        referenceLatInput.setText(String.format(Locale.US, "%.6f", DEFAULT_REFERENCE_LATITUDE));
+        referenceLonInput.setText(String.format(Locale.US, "%.6f", DEFAULT_REFERENCE_LONGITUDE));
+        referenceAltInput.setText(String.format(Locale.US, "%.1f", DEFAULT_REFERENCE_ALTITUDE));
+        applyReferenceInputsFromUi("默认定位");
+    }
+
+    private void applyReferenceInputsFromUi(String source) {
+        referenceInitializedFromInput = false;
+        if (!applyReferenceFromInputs()) {
+            return;
+        }
+        saveSettings();
+        if (trackPoints.isEmpty()) {
+            resetImuNavigationProcessor();
+        } else {
+            appendLog("WARN 当前已有轨迹，新的参考原点建议下次读取/连接前使用");
+        }
+        if (aMap != null) {
+            mapUserZoomLocked = false;
+            aMap.animateCamera(CameraUpdateFactory.newLatLngZoom(
+                    new LatLng(referenceLatitude, referenceLongitude),
+                    18f
+            ));
+        }
+        appendLog("INFO " + source + "已写入参考原点");
+        updateAllViews();
     }
 
     private boolean applyReferenceFromInputs() {
@@ -1524,9 +1946,9 @@ public class MainActivity extends AppCompatActivity {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         hostInput.setText(prefs.getString("host", "192.168.16.254"));
         portInput.setText(prefs.getString("port", "8000"));
-        referenceLatInput.setText(prefs.getString("reference_latitude", "30.659462"));
-        referenceLonInput.setText(prefs.getString("reference_longitude", "104.065735"));
-        referenceAltInput.setText(prefs.getString("reference_altitude", "482.0"));
+        referenceLatInput.setText(prefs.getString("reference_latitude", String.valueOf(DEFAULT_REFERENCE_LATITUDE)));
+        referenceLonInput.setText(prefs.getString("reference_longitude", String.valueOf(DEFAULT_REFERENCE_LONGITUDE)));
+        referenceAltInput.setText(prefs.getString("reference_altitude", String.valueOf(DEFAULT_REFERENCE_ALTITUDE)));
         setSpinnerValue(transportSpinner, prefs.getString("transport", "TCP Client"));
         setSpinnerValue(protocolSpinner, prefs.getString("protocol", "IMU CSV"));
         setSpinnerValue(modeSpinner, prefs.getString("mode", "IMU 解算模式"));
@@ -1574,26 +1996,65 @@ public class MainActivity extends AppCompatActivity {
         if (recording) {
             stopRecordingIfNeeded(true);
         }
-        ArrayList<Uri> uris = new ArrayList<>();
-        for (File file : files) {
-            Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", file);
-            uris.add(uri);
+        try {
+            File exportFile = createRecordingZip(files);
+            Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", exportFile);
+            Intent intent = new Intent(Intent.ACTION_SEND);
+            intent.setType("application/zip");
+            intent.putExtra(Intent.EXTRA_STREAM, uri);
+            intent.putExtra(Intent.EXTRA_SUBJECT, "IMU 记录数据");
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            intent.setClipData(ClipData.newUri(getContentResolver(), exportFile.getName(), uri));
+            grantSharePermissions(intent, uri);
+            appendLog("INFO 导出记录压缩包: " + exportFile.getName());
+            startActivity(Intent.createChooser(intent, "分享 IMU 记录到微信/QQ"));
+        } catch (Exception error) {
+            appendLog("ERROR 导出记录失败: " + error.getMessage());
         }
-        Intent intent = new Intent(Intent.ACTION_SEND_MULTIPLE);
-        intent.setType("text/*");
-        intent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris);
-        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        appendLog("INFO 导出记录文件: " + files.size() + " 个");
-        startActivity(Intent.createChooser(intent, "导出 IMU 记录"));
+    }
+
+    private File createRecordingZip(List<File> files) throws IOException {
+        File directory = getExternalCacheDir();
+        if (directory == null) {
+            directory = getCacheDir();
+        }
+        if (!directory.exists() && !directory.mkdirs()) {
+            throw new IOException("无法创建导出缓存目录");
+        }
+        String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+        File zipFile = new File(directory, "imu_record_" + stamp + ".zip");
+        byte[] buffer = new byte[8192];
+        try (ZipOutputStream zip = new ZipOutputStream(new FileOutputStream(zipFile))) {
+            for (File file : files) {
+                if (file == null || !file.exists() || !file.isFile()) {
+                    continue;
+                }
+                zip.putNextEntry(new ZipEntry(file.getName()));
+                try (FileInputStream input = new FileInputStream(file)) {
+                    int count;
+                    while ((count = input.read(buffer)) >= 0) {
+                        zip.write(buffer, 0, count);
+                    }
+                }
+                zip.closeEntry();
+            }
+        }
+        return zipFile;
+    }
+
+    private void grantSharePermissions(Intent intent, Uri uri) {
+        List<ResolveInfo> targets = getPackageManager().queryIntentActivities(intent, 0);
+        for (ResolveInfo target : targets) {
+            if (target.activityInfo != null && target.activityInfo.packageName != null) {
+                grantUriPermission(target.activityInfo.packageName, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            }
+        }
     }
 
     private void updateTransportUi() {
         boolean fileMode = "文件读取 File".equals(currentTransport());
-        if (hostRow != null) {
-            hostRow.setVisibility(fileMode ? View.GONE : View.VISIBLE);
-        }
-        if (portRow != null) {
-            portRow.setVisibility(fileMode ? View.GONE : View.VISIBLE);
+        if (endpointRow != null) {
+            endpointRow.setVisibility(fileMode ? View.GONE : View.VISIBLE);
         }
         if (fileRow != null) {
             fileRow.setVisibility(fileMode ? View.VISIBLE : View.GONE);
@@ -1664,11 +2125,11 @@ public class MainActivity extends AppCompatActivity {
         mapPage.setVisibility(View.GONE);
         devicePage.setVisibility(View.GONE);
         trajectoryTab.setTextColor(Color.WHITE);
-        trajectoryTab.setBackground(plainDrawable(COLOR_BLUE, COLOR_BLUE, dp(8)));
+        trajectoryTab.setBackground(buttonDrawable(COLOR_BLUE, COLOR_BLUE, dp(8)));
         mapTab.setTextColor(COLOR_MUTED);
-        mapTab.setBackground(plainDrawable(Color.WHITE, COLOR_BORDER, dp(8)));
+        mapTab.setBackground(buttonDrawable(Color.WHITE, COLOR_BORDER, dp(8)));
         deviceTab.setTextColor(COLOR_MUTED);
-        deviceTab.setBackground(plainDrawable(Color.WHITE, COLOR_BORDER, dp(8)));
+        deviceTab.setBackground(buttonDrawable(Color.WHITE, COLOR_BORDER, dp(8)));
     }
 
     private void showMapPage() {
@@ -1676,11 +2137,11 @@ public class MainActivity extends AppCompatActivity {
         mapPage.setVisibility(View.VISIBLE);
         devicePage.setVisibility(View.GONE);
         trajectoryTab.setTextColor(COLOR_MUTED);
-        trajectoryTab.setBackground(plainDrawable(Color.WHITE, COLOR_BORDER, dp(8)));
+        trajectoryTab.setBackground(buttonDrawable(Color.WHITE, COLOR_BORDER, dp(8)));
         mapTab.setTextColor(Color.WHITE);
-        mapTab.setBackground(plainDrawable(COLOR_BLUE, COLOR_BLUE, dp(8)));
+        mapTab.setBackground(buttonDrawable(COLOR_BLUE, COLOR_BLUE, dp(8)));
         deviceTab.setTextColor(COLOR_MUTED);
-        deviceTab.setBackground(plainDrawable(Color.WHITE, COLOR_BORDER, dp(8)));
+        deviceTab.setBackground(buttonDrawable(Color.WHITE, COLOR_BORDER, dp(8)));
         pushTrackToMap(true);
     }
 
@@ -1689,11 +2150,11 @@ public class MainActivity extends AppCompatActivity {
         mapPage.setVisibility(View.GONE);
         devicePage.setVisibility(View.VISIBLE);
         trajectoryTab.setTextColor(COLOR_MUTED);
-        trajectoryTab.setBackground(plainDrawable(Color.WHITE, COLOR_BORDER, dp(8)));
+        trajectoryTab.setBackground(buttonDrawable(Color.WHITE, COLOR_BORDER, dp(8)));
         mapTab.setTextColor(COLOR_MUTED);
-        mapTab.setBackground(plainDrawable(Color.WHITE, COLOR_BORDER, dp(8)));
+        mapTab.setBackground(buttonDrawable(Color.WHITE, COLOR_BORDER, dp(8)));
         deviceTab.setTextColor(Color.WHITE);
-        deviceTab.setBackground(plainDrawable(COLOR_BLUE, COLOR_BLUE, dp(8)));
+        deviceTab.setBackground(buttonDrawable(COLOR_BLUE, COLOR_BLUE, dp(8)));
     }
 
     private TextView addMetric(LinearLayout row, String label, String value) {
@@ -1709,6 +2170,34 @@ public class MainActivity extends AppCompatActivity {
         return valueView;
     }
 
+    private LinearLayout compactFormRow(String label, View input) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        TextView labelView = text(label, 12, COLOR_MUTED, Typeface.NORMAL);
+        row.addView(labelView, new LinearLayout.LayoutParams(dp(48), LinearLayout.LayoutParams.WRAP_CONTENT));
+        row.addView(input, new LinearLayout.LayoutParams(0, dp(36), 1f));
+        return row;
+    }
+
+    private LinearLayout compactStackField(String label, View input) {
+        LinearLayout field = new LinearLayout(this);
+        field.setOrientation(LinearLayout.VERTICAL);
+        TextView labelView = text(label, 11, COLOR_MUTED, Typeface.NORMAL);
+        field.addView(labelView, matchWrap());
+        field.addView(input, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(36)
+        ));
+        return field;
+    }
+
+    private LinearLayout.LayoutParams compactFieldParams(int leftMargin) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        params.setMargins(leftMargin, 0, 0, 0);
+        return params;
+    }
+
     private LinearLayout formRow(String label, View input) {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
@@ -1717,6 +2206,14 @@ public class MainActivity extends AppCompatActivity {
         row.addView(labelView, new LinearLayout.LayoutParams(dp(76), LinearLayout.LayoutParams.WRAP_CONTENT));
         row.addView(input, new LinearLayout.LayoutParams(0, dp(42), 1f));
         return row;
+    }
+
+    private LinearLayout compactCard() {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(10), dp(8), dp(10), dp(8));
+        card.setBackground(cardDrawable());
+        return card;
     }
 
     private LinearLayout card() {
@@ -1774,7 +2271,7 @@ public class MainActivity extends AppCompatActivity {
         button.setTextSize(13);
         button.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         button.setTextColor(color);
-        button.setBackground(plainDrawable(Color.WHITE, color, dp(6)));
+        button.setBackground(buttonDrawable(Color.WHITE, color, dp(6)));
         return button;
     }
 
@@ -1785,7 +2282,7 @@ public class MainActivity extends AppCompatActivity {
         button.setTextSize(14);
         button.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         button.setTextColor(Color.WHITE);
-        button.setBackground(plainDrawable(COLOR_BLUE, COLOR_BLUE, dp(6)));
+        button.setBackground(buttonDrawable(COLOR_BLUE, COLOR_BLUE, dp(6)));
         return button;
     }
 
@@ -1795,7 +2292,7 @@ public class MainActivity extends AppCompatActivity {
         button.setText(text);
         button.setTextSize(12);
         button.setTextColor(COLOR_BLUE);
-        button.setBackground(plainDrawable(Color.WHITE, COLOR_BORDER, dp(6)));
+        button.setBackground(buttonDrawable(Color.WHITE, COLOR_BORDER, dp(6)));
         return button;
     }
 
@@ -1805,6 +2302,7 @@ public class MainActivity extends AppCompatActivity {
         button.setText(text);
         button.setTextSize(15);
         button.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        button.setBackground(buttonDrawable(Color.WHITE, COLOR_BORDER, dp(8)));
         return button;
     }
 
@@ -1818,6 +2316,36 @@ public class MainActivity extends AppCompatActivity {
         drawable.setStroke(dp(1), stroke);
         drawable.setCornerRadius(radius);
         return drawable;
+    }
+
+    private StateListDrawable buttonDrawable(int fill, int stroke, int radius) {
+        StateListDrawable drawable = new StateListDrawable();
+        drawable.addState(new int[]{android.R.attr.state_pressed}, plainDrawable(pressedColor(fill), stroke, radius));
+        drawable.addState(new int[]{android.R.attr.state_focused}, plainDrawable(pressedColor(fill), stroke, radius));
+        drawable.addState(new int[]{-android.R.attr.state_enabled}, plainDrawable(disabledColor(fill), disabledColor(stroke), radius));
+        drawable.addState(new int[]{}, plainDrawable(fill, stroke, radius));
+        return drawable;
+    }
+
+    private int pressedColor(int color) {
+        return blendColor(color, Color.BLACK, isLightColor(color) ? 0.08f : 0.18f);
+    }
+
+    private int disabledColor(int color) {
+        return blendColor(color, Color.WHITE, 0.55f);
+    }
+
+    private boolean isLightColor(int color) {
+        return Color.red(color) + Color.green(color) + Color.blue(color) > 600;
+    }
+
+    private int blendColor(int from, int to, float ratio) {
+        float inverse = 1f - ratio;
+        return Color.rgb(
+                Math.round(Color.red(from) * inverse + Color.red(to) * ratio),
+                Math.round(Color.green(from) * inverse + Color.green(to) * ratio),
+                Math.round(Color.blue(from) * inverse + Color.blue(to) * ratio)
+        );
     }
 
     private LinearLayout.LayoutParams matchWrap() {
@@ -1836,6 +2364,12 @@ public class MainActivity extends AppCompatActivity {
     private LinearLayout.LayoutParams sectionParams() {
         LinearLayout.LayoutParams params = matchWrap();
         params.setMargins(0, dp(10), 0, 0);
+        return params;
+    }
+
+    private LinearLayout.LayoutParams compactSectionParams() {
+        LinearLayout.LayoutParams params = matchWrap();
+        params.setMargins(0, dp(6), 0, 0);
         return params;
     }
 

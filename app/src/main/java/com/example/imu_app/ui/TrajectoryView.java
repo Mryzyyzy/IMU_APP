@@ -7,6 +7,8 @@ import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.RectF;
 import android.util.AttributeSet;
+import android.view.MotionEvent;
+import android.view.ScaleGestureDetector;
 import android.view.View;
 
 import com.example.imu_app.model.TrackPoint;
@@ -19,6 +21,8 @@ public class TrajectoryView extends View {
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final RectF plotRect = new RectF();
     private final List<TrackPoint> points = new ArrayList<>();
+    private ScaleGestureDetector scaleDetector;
+    private double zoomFactor = 1.0;
 
     public TrajectoryView(Context context) {
         super(context);
@@ -32,6 +36,7 @@ public class TrajectoryView extends View {
 
     private void init() {
         setMinimumHeight(dp(300));
+        scaleDetector = new ScaleGestureDetector(getContext(), new ScaleListener());
     }
 
     public void setTrack(List<TrackPoint> newPoints) {
@@ -45,6 +50,17 @@ public class TrajectoryView extends View {
         invalidate();
     }
 
+    private void setZoomFactor(double value) {
+        zoomFactor = Math.max(0.25, Math.min(8.0, value));
+        invalidate();
+    }
+
+    @Override
+    public boolean onTouchEvent(MotionEvent event) {
+        scaleDetector.onTouchEvent(event);
+        return true;
+    }
+
     @Override
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
@@ -56,14 +72,14 @@ public class TrajectoryView extends View {
         }
         Bounds bounds = bounds();
         drawScale(canvas, bounds);
+        drawAxes(canvas, bounds);
         drawTrack(canvas, bounds);
         drawCurrentMarker(canvas, bounds);
     }
 
     private void drawBackground(Canvas canvas) {
         canvas.drawColor(Color.WHITE);
-        float inset = dp(14);
-        plotRect.set(inset, inset, getWidth() - inset, getHeight() - dp(36));
+        plotRect.set(dp(48), dp(20), getWidth() - dp(16), getHeight() - dp(48));
         paint.setStyle(Paint.Style.STROKE);
         paint.setStrokeWidth(dp(1));
         paint.setColor(Color.rgb(217, 225, 236));
@@ -167,6 +183,39 @@ public class TrajectoryView extends View {
         canvas.drawText(String.format(Locale.US, "%.0f m", scale), x0 + length / 2f, y - dp(8), paint);
     }
 
+    private void drawAxes(Canvas canvas, Bounds bounds) {
+        paint.setStyle(Paint.Style.FILL);
+        paint.setTextSize(sp(10));
+        paint.setColor(Color.rgb(71, 85, 105));
+
+        double minEast = bounds.minEast;
+        double midEast = (bounds.minEast + bounds.maxEast) * 0.5;
+        double maxEast = bounds.maxEast;
+        double minNorth = bounds.minNorth;
+        double midNorth = (bounds.minNorth + bounds.maxNorth) * 0.5;
+        double maxNorth = bounds.maxNorth;
+
+        float yLabel = plotRect.bottom + dp(16);
+        paint.setTextAlign(Paint.Align.LEFT);
+        canvas.drawText(formatAxis(minEast), plotRect.left, yLabel, paint);
+        paint.setTextAlign(Paint.Align.CENTER);
+        canvas.drawText(formatAxis(midEast), plotRect.centerX(), yLabel, paint);
+        paint.setTextAlign(Paint.Align.RIGHT);
+        canvas.drawText(formatAxis(maxEast), plotRect.right, yLabel, paint);
+
+        paint.setTextAlign(Paint.Align.RIGHT);
+        canvas.drawText(formatAxis(maxNorth), plotRect.left - dp(6), plotRect.top + dp(4), paint);
+        canvas.drawText(formatAxis(midNorth), plotRect.left - dp(6), plotRect.centerY() + dp(4), paint);
+        canvas.drawText(formatAxis(minNorth), plotRect.left - dp(6), plotRect.bottom, paint);
+
+        paint.setTextAlign(Paint.Align.RIGHT);
+        paint.setTextSize(sp(11));
+        paint.setColor(Color.rgb(23, 32, 51));
+        canvas.drawText("E / m", plotRect.right, plotRect.bottom + dp(34), paint);
+        paint.setTextAlign(Paint.Align.LEFT);
+        canvas.drawText("N / m", plotRect.left, plotRect.top - dp(6), paint);
+    }
+
     private Bounds bounds() {
         double minEast = Double.POSITIVE_INFINITY;
         double maxEast = Double.NEGATIVE_INFINITY;
@@ -180,7 +229,7 @@ public class TrajectoryView extends View {
         }
         double centerEast = (minEast + maxEast) / 2.0;
         double centerNorth = (minNorth + maxNorth) / 2.0;
-        double span = Math.max(Math.max(maxEast - minEast, maxNorth - minNorth), 20.0);
+        double span = Math.max(Math.max(maxEast - minEast, maxNorth - minNorth), 20.0) / zoomFactor;
         double pad = span * 0.24;
         double aspect = Math.max(plotRect.width(), 1f) / Math.max(plotRect.height(), 1f);
         double halfNorth = span / 2.0 + pad;
@@ -213,6 +262,20 @@ public class TrajectoryView extends View {
         return best;
     }
 
+    private String formatAxis(double value) {
+        double abs = Math.abs(value);
+        if (abs >= 1000.0) {
+            return String.format(Locale.US, "%.1fk", value / 1000.0);
+        }
+        if (abs >= 100.0) {
+            return String.format(Locale.US, "%.0f", value);
+        }
+        if (abs >= 10.0) {
+            return String.format(Locale.US, "%.1f", value);
+        }
+        return String.format(Locale.US, "%.2f", value);
+    }
+
     private int dp(float value) {
         return (int) (value * getResources().getDisplayMetrics().density + 0.5f);
     }
@@ -232,6 +295,14 @@ public class TrajectoryView extends View {
             this.maxEast = maxEast;
             this.minNorth = minNorth;
             this.maxNorth = maxNorth;
+        }
+    }
+
+    private final class ScaleListener extends ScaleGestureDetector.SimpleOnScaleGestureListener {
+        @Override
+        public boolean onScale(ScaleGestureDetector detector) {
+            setZoomFactor(zoomFactor * detector.getScaleFactor());
+            return true;
         }
     }
 }
